@@ -1,0 +1,8 @@
+Model Information:
+* title:	FlightHelmet
+* source:	https://sketchfab.com/3d-models/flighthelmet-f7f13357977944a98458cc67ec8c52c1
+* author:	mikhailgororbets (https://sketchfab.com/mikhailgororbets)
+
+Model License:
+* license type:	SKETCHFAB Standard (https://sketchfab.com/licenses)
+* requirements:	Under basic restrictions, use worldwide, on all types of media, commercially or not, and in all types of derivative works

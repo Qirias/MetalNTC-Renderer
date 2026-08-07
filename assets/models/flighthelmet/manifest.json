@@ -1,0 +1,159 @@
+{
+  "models" : [
+    {
+      "name" : "GlassPlasticMat",
+      "textures" : [
+        {
+          "fileName" : "textures/GlassPlasticMat_baseColor.jpeg",
+          "isSRGB" : true,
+          "semantics" : {
+            "Albedo" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/GlassPlasticMat_normal.jpeg",
+          "semantics" : {
+            "Normal" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/GlassPlasticMat_metallicRoughness.png",
+          "semantics" : {
+            "Metalness" : "B",
+            "Roughness" : "G"
+          }
+        },
+        {
+          "fileName" : "textures/GlassPlasticMat_metallicRoughness.png",
+          "semantics" : {
+            "Occlusion" : "R"
+          }
+        }
+      ]
+    },
+    {
+      "name" : "LeatherPartsMat",
+      "textures" : [
+        {
+          "fileName" : "textures/LeatherPartsMat_baseColor.jpeg",
+          "isSRGB" : true,
+          "semantics" : {
+            "Albedo" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/LeatherPartsMat_normal.jpeg",
+          "semantics" : {
+            "Normal" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/LeatherPartsMat_metallicRoughness.png",
+          "semantics" : {
+            "Metalness" : "B",
+            "Roughness" : "G"
+          }
+        },
+        {
+          "fileName" : "textures/LeatherPartsMat_metallicRoughness.png",
+          "semantics" : {
+            "Occlusion" : "R"
+          }
+        }
+      ]
+    },
+    {
+      "name" : "LensesMat",
+      "textures" : [
+        {
+          "fileName" : "textures/LensesMat_baseColor.png",
+          "isSRGB" : true,
+          "semantics" : {
+            "Albedo" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/LensesMat_normal.jpeg",
+          "semantics" : {
+            "Normal" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/LensesMat_metallicRoughness.png",
+          "semantics" : {
+            "Metalness" : "B",
+            "Roughness" : "G"
+          }
+        },
+        {
+          "fileName" : "textures/LensesMat_metallicRoughness.png",
+          "semantics" : {
+            "Occlusion" : "R"
+          }
+        }
+      ]
+    },
+    {
+      "name" : "MetalPartsMat",
+      "textures" : [
+        {
+          "fileName" : "textures/MetalPartsMat_baseColor.jpeg",
+          "isSRGB" : true,
+          "semantics" : {
+            "Albedo" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/MetalPartsMat_normal.jpeg",
+          "semantics" : {
+            "Normal" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/MetalPartsMat_metallicRoughness.png",
+          "semantics" : {
+            "Metalness" : "B",
+            "Roughness" : "G"
+          }
+        },
+        {
+          "fileName" : "textures/MetalPartsMat_metallicRoughness.png",
+          "semantics" : {
+            "Occlusion" : "R"
+          }
+        }
+      ]
+    },
+    {
+      "name" : "RubberWoodMat",
+      "textures" : [
+        {
+          "fileName" : "textures/RubberWoodMat_baseColor.jpeg",
+          "isSRGB" : true,
+          "semantics" : {
+            "Albedo" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/RubberWoodMat_normal.jpeg",
+          "semantics" : {
+            "Normal" : "RGB"
+          }
+        },
+        {
+          "fileName" : "textures/RubberWoodMat_metallicRoughness.png",
+          "semantics" : {
+            "Metalness" : "B",
+            "Roughness" : "G"
+          }
+        },
+        {
+          "fileName" : "textures/RubberWoodMat_metallicRoughness.png",
+          "semantics" : {
+            "Occlusion" : "R"
+          }
+        }
+      ]
+    }
+  ]
+}
