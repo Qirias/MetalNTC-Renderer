@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Metal
 import MetalKit
 import simd
@@ -105,7 +106,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         let ntcIndex:     Int
     }
 
-    private let ntcResources: [NTCResource]
+    private let ntcVariants: [(quality: Quality, resources: [NTCResource])]
+    private var activeVariant: Int
+
+    var availableQualities: [Quality] { ntcVariants.map(\.quality) }
+    var activeQualityIndex: Int { activeVariant }
+
     private let submeshes:    [DrawSubmesh]
 
     private let benchmark: Bool
@@ -113,14 +119,52 @@ final class Renderer: NSObject, MTKViewDelegate {
     var startTime: CFTimeInterval = CACurrentMediaTime()
     var aspect: Float = 1.0
 
-    /// Translates the model's world-space bounding-box center to the origin, so
-    /// it sits at screen center (the camera looks at the origin) and spins about
-    /// its own center rather than orbiting.
     private let recenter: simd_float4x4
 
     private var gpuTimes: [Double] = []
 
     private var frameIndex: UInt64 = 0
+
+    // MARK: Render toggles / camera state
+
+    private enum RenderFlags {
+        static let stochasticLOD: UInt32 = 1 << 0
+    }
+
+    var stochasticLOD = true
+    var temporalAccumulation = true
+    var autoRotate = true
+
+    private var yaw: Float = 0
+    private var pitch: Float = 0
+    private var cameraDistance: Float = 0.8
+    private let cameraDistanceRange: ClosedRange<Float> = 0.15...5.0
+
+    func rotate(deltaX: Float, deltaY: Float) {
+        guard !autoRotate else { return }
+        yaw += deltaX * 0.01
+        // clamp just shy of the poles so the up vector never degenerates
+        pitch = min(max(pitch + deltaY * 0.01, -1.5), 1.5)
+    }
+
+    func zoom(delta: Float) {
+        let updated = cameraDistance * exp(-delta * 0.05)   // exponential: even feel at any distance
+        cameraDistance = min(max(updated, cameraDistanceRange.lowerBound), cameraDistanceRange.upperBound)
+        // the camera MOVED, so the accumulated history was rendered from a
+        // different viewpoint; delta-rotation reprojection cannot map it
+        historyValid = false
+    }
+
+    @objc func stochasticLODChanged(_ sender: NSButton) { stochasticLOD = sender.state == .on }
+    @objc func temporalChanged(_ sender: NSButton) {
+        temporalAccumulation = sender.state == .on
+        historyValid = false
+    }
+    @objc func autoRotateChanged(_ sender: NSButton) {
+        autoRotate = sender.state == .on
+        // resync so handing control back to the clock does not jump
+        if autoRotate { startTime = CACurrentMediaTime() - Double(yaw / 0.7) }
+    }
 
     init(view: MTKView, device: any MTLDevice, gltfURL: URL, hdrURL: URL,
          benchmark: Bool, benchmarkNTC: URL) throws {
@@ -149,7 +193,8 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         if benchmark {
             let resource = try Renderer.loadNTCResource(device: device, url: benchmarkNTC)
-            self.ntcResources = [resource]
+            self.ntcVariants   = [(.high, [resource])]
+            self.activeVariant = 0
             self.submeshes     = []
             self.recenter      = matrix_identity_float4x4
             super.init()
@@ -162,24 +207,41 @@ final class Renderer: NSObject, MTKViewDelegate {
         let scene = try GLTF.loadScene(at: gltfURL)
         let dir   = gltfURL.deletingLastPathComponent()
 
-        var resources: [NTCResource]   = []
+        // materials in first-seen order, keeping only those trained at some
+        // quality; a submesh whose material has none is skipped below
+        var materialNames: [String]    = []
         var indexByName: [String: Int] = [:]
-        var draws: [DrawSubmesh]       = []
+        for submesh in scene.submeshes where indexByName[submesh.materialName] == nil {
+            let trained = Quality.allCases.contains {
+                Renderer.ntcURL(dir: dir, material: submesh.materialName, quality: $0) != nil
+            }
+            guard trained else { continue }
+            indexByName[submesh.materialName] = materialNames.count
+            materialNames.append(submesh.materialName)
+        }
+
+        var variants: [(quality: Quality, resources: [NTCResource])] = []
+        for quality in Quality.allCases {
+            let urls = materialNames.map { Renderer.ntcURL(dir: dir, material: $0, quality: quality) }
+            guard urls.allSatisfy({ $0 != nil }) else { continue }
+            variants.append((quality, try urls.map {
+                try Renderer.loadNTCResource(device: device, url: $0!)
+            }))
+        }
+        guard !variants.isEmpty else {
+            throw GLTF.Error.missing("no trained .ntc beside \(gltfURL.lastPathComponent)")
+        }
+        self.ntcVariants = variants
+        // open on .high when it is there, else the best that is
+        self.activeVariant = variants.firstIndex { $0.quality == .high } ?? variants.count - 1
+
+        var draws: [DrawSubmesh] = []
 
         var boundsMin = SIMD3<Float>(repeating:  .greatestFiniteMagnitude)
         var boundsMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
 
         for submesh in scene.submeshes {
-            let ntcIndex: Int
-            if let cached = indexByName[submesh.materialName] {
-                ntcIndex = cached
-            } else {
-                let url = dir.appendingPathComponent("\(submesh.materialName).ntc")
-                let resource = try Renderer.loadNTCResource(device: device, url: url)
-                ntcIndex = resources.count
-                resources.append(resource)
-                indexByName[submesh.materialName] = ntcIndex
-            }
+            guard let ntcIndex = indexByName[submesh.materialName] else { continue }
 
             for position in submesh.positions {
                 let world = submesh.transform * SIMD4<Float>(position, 1)
@@ -212,7 +274,6 @@ final class Renderer: NSObject, MTKViewDelegate {
         recenterMatrix.columns.3 = SIMD4<Float>(-center.x, -center.y, -center.z, 1)
         self.recenter = recenterMatrix
 
-        self.ntcResources = resources
         self.submeshes     = draws
 
 
@@ -244,7 +305,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.aspect = Float(view.drawableSize.width / max(view.drawableSize.height, 1))
         allocateTargets(width: max(Int(view.drawableSize.width), 1),
                         height: max(Int(view.drawableSize.height), 1))
-        print("loaded \(draws.count) submesh(es), \(resources.count) material(s)")
+        let qualityList = variants.map(\.quality.rawValue).joined(separator: ", ")
+        print("loaded \(draws.count) submesh(es), \(materialNames.count) material(s); qualities: \(qualityList)")
     }
 
     private func allocateTargets(width: Int, height: Int) {
@@ -275,6 +337,25 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         self.historyIndex = 0
         self.historyValid = false
+    }
+
+    /// Where one material's latents live for a given quality, or nil if that
+    /// pair was never trained.
+    fileprivate static func ntcURL(dir: URL, material: String, quality: Quality) -> URL? {
+        let url = dir.appendingPathComponent(quality.ntcFileName(base: material))
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    func selectQuality(index: Int) {
+        guard ntcVariants.indices.contains(index), index != activeVariant else { return }
+        activeVariant = index
+        // the accumulated history is of the OLD latents; keep it and the resolve
+        // blends the switch in over several frames instead of showing it
+        historyValid = false
+    }
+
+    @objc func qualityChanged(_ sender: NSSegmentedControl) {
+        selectQuality(index: sender.selectedSegment)
     }
 
     /// Decode one .ntc into GPU resources (latent texture, mlp buffer, consts,
@@ -449,13 +530,14 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let commandBuffer = queue.makeCommandBuffer()!
         var frame = UInt32(truncatingIfNeeded: frameIndex)
+        var flags: UInt32 = stochasticLOD ? RenderFlags.stochasticLOD : 0
 
         if benchmark {
             guard let renderPassDesc = view.currentRenderPassDescriptor else { return }
             let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc)!
             encoder.setRenderPipelineState(meshPSO)
             encoder.setDepthStencilState(depthState)
-            var resource = ntcResources[0]
+            var resource = ntcVariants[activeVariant].resources[0]
             encoder.setCullMode(.none)
             encoder.setFragmentTexture(resource.latentTexture, index: 0)
             encoder.setFragmentBuffer(resource.mlpBuffer,    offset: 0, index: 1)
@@ -465,6 +547,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             encoder.setFragmentBytes(&resource.gridDequant,
                                      length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
             encoder.setFragmentBytes(&frame, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.setFragmentBytes(&flags, length: MemoryLayout<UInt32>.stride, index: 7)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             encoder.endEncoding()
         } else {
@@ -473,9 +556,12 @@ final class Renderer: NSObject, MTKViewDelegate {
                   let resolvePSO = resolvePSO,
                   historyTextures.count == 2 else { return }
 
-            let camEye = SIMD3<Float>(0, 0.0, 0.8)
-            let time = Float(CACurrentMediaTime() - startTime)
-            let spin = matrix4x4_rotation(time * 0.7, 0, 1, 0)
+            let camEye = SIMD3<Float>(0, 0.0, cameraDistance)
+            if autoRotate {
+                yaw = Float(CACurrentMediaTime() - startTime) * 0.7
+            }
+            // yaw then pitch, both pure rotations -- see the note on `yaw`
+            let spin = matrix4x4_rotation(yaw, 0, 1, 0) * matrix4x4_rotation(pitch, 1, 0, 0)
             let viewMatrix = matrix_look_at_right_hand(camEye,
                                                        SIMD3<Float>(0, 0, 0),
                                                        SIMD3<Float>(0, 1, 0))
@@ -506,7 +592,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                 var uniforms = MeshUniforms(mvp: viewProj * model,
                                             model: model,
                                             normalMatrix: matrix_inverse_transpose(model))
-                var resource = ntcResources[submesh.ntcIndex]   // value copy; setFragmentBytes needs inout
+                var resource = ntcVariants[activeVariant].resources[submesh.ntcIndex]   // value copy; setFragmentBytes needs inout
 
                 encoder.setVertexBuffer(submesh.vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<MeshUniforms>.stride, index: 1)
@@ -522,6 +608,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                                          length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
                 encoder.setFragmentBytes(&frame, length: MemoryLayout<UInt32>.stride, index: 5)
                 encoder.setFragmentBytes(&camPos, length: MemoryLayout<SIMD3<Float>>.stride, index: 6)
+                encoder.setFragmentBytes(&flags, length: MemoryLayout<UInt32>.stride, index: 7)
                 encoder.drawIndexedPrimitives(type: .triangle,
                                               indexCount: submesh.indexCount,
                                               indexType: .uint32,
@@ -544,7 +631,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             var uniforms = TemporalUniforms(viewProj:      viewProj,
                                             invViewProj:   invViewProj,
                                             deltaRotation: prevSpin * simd_inverse(spin),
-                                            historyValid:  historyValid ? 1 : 0)
+                                            historyValid:  (historyValid && temporalAccumulation) ? 1 : 0)
 
             let resolve = commandBuffer.makeComputeCommandEncoder()!
             resolve.setComputePipelineState(resolvePSO)

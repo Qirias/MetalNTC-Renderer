@@ -94,16 +94,19 @@ constexpr sampler latentSampler(coord::normalized,
 constexpr sampler iblSampler(filter::linear, mip_filter::linear, address::clamp_to_edge);
 constexpr sampler brdfSampler(filter::linear, address::clamp_to_edge);
 
-constant bool kStochasticFilter = true;
+// Runtime render toggles, packed into the `renderFlags` fragment buffer.
+// Mirrored by `RenderFlags` in renderer.swift -- keep the bits in sync.
+#define RENDER_FLAG_STOCHASTIC_LOD  (1u << 0)
 
 static inline uint select_lod(float2 uv, float2 pixelCoord, uint frameIndex,
+                              bool stochastic,
                               constant StepConstants& consts) {
     float2 dx = dfdx(uv) * float(consts.srcW);
     float2 dy = dfdy(uv) * float(consts.srcH);
     float lodf = clamp(0.5 * log2(max(dot(dx, dx), dot(dy, dy))),
                        0.0, float(consts.mipCount - 1));
 
-    if (kStochasticFilter) {
+    if (stochastic) {
         float base = floor(lodf);
         float frac = lodf - base;
         float jitter = hash01(uint(pixelCoord.x), uint(pixelCoord.y), frameIndex);
@@ -148,8 +151,10 @@ fragment float4 mesh_fs(VertexOut                  in          [[stage_in]],
                         constant MaterialLayout&   layout      [[buffer(3)]],
                         constant float2&           gridDequant [[buffer(4)]],
                         constant uint&             frameIndex  [[buffer(5)]],
-                        constant float3&           cameraPos   [[buffer(6)]]) {
-    uint lod = select_lod(in.uv, in.position.xy, frameIndex, consts);
+                        constant float3&           cameraPos   [[buffer(6)]],
+                        constant uint&             renderFlags [[buffer(7)]]) {
+    uint lod = select_lod(in.uv, in.position.xy, frameIndex,
+                          (renderFlags & RENDER_FLAG_STOCHASTIC_LOD) != 0u, consts);
     Material material = sample_material(in.uv, lod, latents, gridDequant, mlp, consts, layout);
 
     float3 geometricNormal = normalize(in.worldNormal);
@@ -199,8 +204,10 @@ fragment float4 bench_fs(BenchOut                   in          [[stage_in]],
                          constant StepConstants&    consts      [[buffer(2)]],
                          constant MaterialLayout&   layout      [[buffer(3)]],
                          constant float2&           gridDequant [[buffer(4)]],
-                         constant uint&             frameIndex  [[buffer(5)]]) {
-    uint lod = select_lod(in.uv, in.position.xy, frameIndex, consts);
+                         constant uint&             frameIndex  [[buffer(5)]],
+                         constant uint&             renderFlags [[buffer(7)]]) {   // mesh_fs has cameraPos at 6
+    uint lod = select_lod(in.uv, in.position.xy, frameIndex,
+                          (renderFlags & RENDER_FLAG_STOCHASTIC_LOD) != 0u, consts);
     Material material = sample_material(in.uv, lod, latents, gridDequant, mlp, consts, layout);
     float3 color = material.albedo + material.emissive;
     return float4(clamp(color, 0.0, 1.0), 1.0);
