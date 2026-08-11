@@ -74,6 +74,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var brdfLut:            (any MTLTexture)? = nil   // pre-integrated split-sum LUT
     private var environmentCubemap: (any MTLTexture)? = nil   // for the skybox
     private var skyboxPSO:          (any MTLRenderPipelineState)? = nil
+    private var blueNoise:          (any MTLTexture)? = nil   // 64x64 STF dither
     private var skyboxDepthState:   (any MTLDepthStencilState)?   = nil
 
 
@@ -167,7 +168,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     init(view: MTKView, device: any MTLDevice, gltfURL: URL, hdrURL: URL,
-         benchmark: Bool, benchmarkNTC: URL) throws {
+         blueNoiseURL: URL, benchmark: Bool, benchmarkNTC: URL) throws {
         self.device = device
         self.queue  = device.makeCommandQueue()!
         self.benchmark = benchmark
@@ -190,6 +191,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         depthDesc.depthCompareFunction = .greater
         depthDesc.isDepthWriteEnabled  = true
         self.depthState = device.makeDepthStencilState(descriptor: depthDesc)!
+
+        self.blueNoise = try Renderer.loadBlueNoise(device: device, url: blueNoiseURL)
 
         if benchmark {
             let resource = try Renderer.loadNTCResource(device: device, url: benchmarkNTC)
@@ -382,6 +385,20 @@ final class Renderer: NSObject, MTKViewDelegate {
         let brdf:        any MTLTexture
     }
 
+
+    fileprivate static func loadBlueNoise(device: any MTLDevice,
+                                          url:    URL) throws -> any MTLTexture {
+        let loader  = MTKTextureLoader(device: device)
+        let texture = try loader.newTexture(URL: url, options: [
+            .textureUsage:       NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+            .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue),
+            .SRGB:               NSNumber(value: false),
+        ])
+        texture.label = "BlueNoise"
+        print("blue noise \(texture.width)x\(texture.height) loaded")
+        return texture
+    }
+
     fileprivate static func buildIBL(device:  any MTLDevice,
                                      queue:   any MTLCommandQueue,
                                      library: any MTLLibrary,
@@ -540,6 +557,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             var resource = ntcVariants[activeVariant].resources[0]
             encoder.setCullMode(.none)
             encoder.setFragmentTexture(resource.latentTexture, index: 0)
+            encoder.setFragmentTexture(blueNoise!,            index: 4)
             encoder.setFragmentBuffer(resource.mlpBuffer,    offset: 0, index: 1)
             encoder.setFragmentBuffer(resource.constsBuffer, offset: 0, index: 2)
             encoder.setFragmentBytes(&resource.materialLayout,
@@ -600,6 +618,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                 encoder.setFragmentTexture(irradianceMap!, index: 1)
                 encoder.setFragmentTexture(radianceMap!,   index: 2)
                 encoder.setFragmentTexture(brdfLut!,       index: 3)
+                encoder.setFragmentTexture(blueNoise!,     index: 4)
                 encoder.setFragmentBuffer(resource.mlpBuffer,    offset: 0, index: 1)
                 encoder.setFragmentBuffer(resource.constsBuffer, offset: 0, index: 2)
                 encoder.setFragmentBytes(&resource.materialLayout,
@@ -710,8 +729,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         let mlpOffW3 = mlpOffB2 + kHidden
         let mlpOffB3 = mlpOffW3 + kHidden * kOutMax
         let mlpCount = mlpOffB3 + kOutMax
-        precondition(ntc.mlp.count == mlpCount,
-                     "mlp half count \(ntc.mlp.count) != expected \(mlpCount)")
+        precondition(ntc.mlp.count == mlpCount, "mlp half count \(ntc.mlp.count) != expected \(mlpCount)")
 
         let latentTex = buildLatentTexture(device: device,
                                            grid: ntc.grid,

@@ -6,12 +6,11 @@ import MetalKit
 
 let benchmark = false
 
-// Demo assets live beside this source file (assets/ in this submodule).
-// #filePath keeps the paths correct wherever the repo is cloned, instead of a
-// machine-specific absolute path.
+
 let assetsDir    = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("assets")
 let gltfURL      = assetsDir.appendingPathComponent("models/flighthelmet/scene.gltf")
 let hdrURL       = assetsDir.appendingPathComponent("hdr/kloppenheim_06_4k.hdr")
+let blueNoiseURL = assetsDir.appendingPathComponent("hdr/LDR_RGB1_0.png")
 let benchmarkNTC = assetsDir.appendingPathComponent("models/flighthelmet/GlassPlasticMat_high.ntc")
 
 if !benchmark {
@@ -70,6 +69,7 @@ mtkView.clearDepth              = 0.0
 mtkView.preferredFramesPerSecond = 60
 
 let renderer = try Renderer(view: mtkView, device: device, gltfURL: gltfURL, hdrURL: hdrURL,
+                            blueNoiseURL: blueNoiseURL,
                             benchmark: benchmark, benchmarkNTC: benchmarkNTC)
 mtkView.delegate = renderer
 mtkView.renderer = renderer

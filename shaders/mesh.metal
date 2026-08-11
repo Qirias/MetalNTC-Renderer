@@ -94,12 +94,10 @@ constexpr sampler latentSampler(coord::normalized,
 constexpr sampler iblSampler(filter::linear, mip_filter::linear, address::clamp_to_edge);
 constexpr sampler brdfSampler(filter::linear, address::clamp_to_edge);
 
-// Runtime render toggles, packed into the `renderFlags` fragment buffer.
-// Mirrored by `RenderFlags` in renderer.swift -- keep the bits in sync.
 #define RENDER_FLAG_STOCHASTIC_LOD  (1u << 0)
 
 static inline uint select_lod(float2 uv, float2 pixelCoord, uint frameIndex,
-                              bool stochastic,
+                              bool stochastic, texture2d<float> blueNoise,
                               constant StepConstants& consts) {
     float2 dx = dfdx(uv) * float(consts.srcW);
     float2 dy = dfdy(uv) * float(consts.srcH);
@@ -109,7 +107,13 @@ static inline uint select_lod(float2 uv, float2 pixelCoord, uint frameIndex,
     if (stochastic) {
         float base = floor(lodf);
         float frac = lodf - base;
-        float jitter = hash01(uint(pixelCoord.x), uint(pixelCoord.y), frameIndex);
+
+        uint bnW = blueNoise.get_width();
+        uint bnH = blueNoise.get_height();
+        float bn = blueNoise.read(uint2(uint(pixelCoord.x) % bnW,
+                                        uint(pixelCoord.y) % bnH)).r;
+        // advancing by the golden ratio per frame
+        float jitter = fract(bn + float(frameIndex) * 0.6180339887f);
         // choose mip stochasticly but use frac as the probability
         return min(uint(base) + (jitter < frac ? 1u : 0u), consts.mipCount - 1u);
     }
@@ -146,6 +150,7 @@ fragment float4 mesh_fs(VertexOut                  in          [[stage_in]],
                         texturecube<float>         irradianceMap [[texture(1)]],
                         texturecube<float>         radianceMap   [[texture(2)]],
                         texture2d<float>           brdfLut       [[texture(3)]],
+                        texture2d<float>           blueNoise     [[texture(4)]],
                         device const half*         mlp         [[buffer(1)]],
                         constant StepConstants&    consts      [[buffer(2)]],
                         constant MaterialLayout&   layout      [[buffer(3)]],
@@ -154,7 +159,8 @@ fragment float4 mesh_fs(VertexOut                  in          [[stage_in]],
                         constant float3&           cameraPos   [[buffer(6)]],
                         constant uint&             renderFlags [[buffer(7)]]) {
     uint lod = select_lod(in.uv, in.position.xy, frameIndex,
-                          (renderFlags & RENDER_FLAG_STOCHASTIC_LOD) != 0u, consts);
+                          (renderFlags & RENDER_FLAG_STOCHASTIC_LOD) != 0u,
+                          blueNoise, consts);
     Material material = sample_material(in.uv, lod, latents, gridDequant, mlp, consts, layout);
 
     float3 geometricNormal = normalize(in.worldNormal);
@@ -200,6 +206,7 @@ fragment float4 mesh_fs(VertexOut                  in          [[stage_in]],
 
 fragment float4 bench_fs(BenchOut                   in          [[stage_in]],
                          texture2d_array<float>     latents     [[texture(0)]],
+                         texture2d<float>           blueNoise   [[texture(4)]],
                          device const half*         mlp         [[buffer(1)]],
                          constant StepConstants&    consts      [[buffer(2)]],
                          constant MaterialLayout&   layout      [[buffer(3)]],
@@ -207,7 +214,8 @@ fragment float4 bench_fs(BenchOut                   in          [[stage_in]],
                          constant uint&             frameIndex  [[buffer(5)]],
                          constant uint&             renderFlags [[buffer(7)]]) {   // mesh_fs has cameraPos at 6
     uint lod = select_lod(in.uv, in.position.xy, frameIndex,
-                          (renderFlags & RENDER_FLAG_STOCHASTIC_LOD) != 0u, consts);
+                          (renderFlags & RENDER_FLAG_STOCHASTIC_LOD) != 0u,
+                          blueNoise, consts);
     Material material = sample_material(in.uv, lod, latents, gridDequant, mlp, consts, layout);
     float3 color = material.albedo + material.emissive;
     return float4(clamp(color, 0.0, 1.0), 1.0);

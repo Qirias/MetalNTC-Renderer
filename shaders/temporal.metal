@@ -66,9 +66,9 @@ kernel void temporal_resolve(texture2d<float, access::read>    currentColor [[te
             // bound the history sample to the current frame's local 3x3 colour box
             float3 boxMin = sampleColor;
             float3 boxMax = sampleColor;
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    int2   coord    = clamp(int2(gid) + int2(dx, dy), int2(0), int2(texSize) - 1);
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    int2   coord    = clamp(int2(gid) + int2(x, y), int2(0), int2(texSize) - 1);
                     float3 neighbor = currentColor.read(uint2(coord)).rgb;
                     boxMin = min(boxMin, neighbor);
                     boxMax = max(boxMax, neighbor);
