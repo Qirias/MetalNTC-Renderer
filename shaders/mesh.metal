@@ -16,10 +16,6 @@ struct MeshUniforms {
     float4x4 normalMatrix;
 };
 
-/// Where each semantic lives in the decoded NTC output. -1 means the .ntc does
-/// not carry that semantic, so the sampler substitutes a neutral default.
-/// Built on the host from the .ntc slot table, so trimming the manifest down to
-/// a single texture does not require a shader change.
 struct MaterialLayout {
     int albedo;
     int normal;
@@ -29,12 +25,9 @@ struct MaterialLayout {
     int emissive;
 };
 
-/// One decoded surface point. Every semantic has a field whether or not this
-/// .ntc carries it -- shading code can read them all today, and only the ones
-/// actually trained carry real data.
 struct Material {
     float3 albedo;
-    float3 normal;      // tangent space, unpacked to [-1, 1]
+    float3 normal;
     float  roughness;
     float  metalness;
     float  occlusion;
@@ -144,7 +137,6 @@ static Material sample_material(float2                   uv,
     return m;
 }
 
-// PBR
 fragment float4 mesh_fs(VertexOut                  in          [[stage_in]],
                         texture2d_array<float>     latents     [[texture(0)]],
                         texturecube<float>         irradianceMap [[texture(1)]],
@@ -199,8 +191,7 @@ fragment float4 mesh_fs(VertexOut                  in          [[stage_in]],
     float3 ambient = (diffuseWeight * diffuse + specular) * material.occlusion;
     float3 color   = ambient + emissive;
 
-    // output linear HDR into the offscreen buffer; the temporal resolve pass
-    // tone-maps
+    // output linear HDR into the offscreen buffer; the temporal resolve pass tone-maps
     return float4(color, in.position.z);
 }
 

@@ -735,8 +735,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                                            grid: ntc.grid,
                                            pyramidSizes: ntc.pyramidSizes.map { Int($0) },
                                            pyramidOffsets: pyramidOffsets,
-                                           fPerGrid: fPerGrid,
-                                           bits: Int(ntc.header.quantBits))
+                                           fPerGrid: fPerGrid)
 
         let mlpBuf = ntc.mlp.withUnsafeBufferPointer { buf in
             device.makeBuffer(bytes: buf.baseAddress!,
@@ -761,8 +760,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     /// shader can bilinear-filter them for free (the shader's scale/bias dequant
     /// is bit-depth agnostic; see `sample_latent_grid`).
     ///
-    /// `bits` selects the storage format: 4 -> `abgr4Unorm` (4 packed/texel),
-    /// 8 -> `rgba8Unorm` (4 bytes/texel). Both are filterable on Apple GPU.
+    /// Storage is `abgr4Unorm`, 4 codes packed into one 16-bit texel, which is
+    /// filterable on Apple GPUs. The grid is 4-bit everywhere (see BITS in the
+    /// trainer); readNTC refuses a .ntc that says otherwise.
     ///
     /// The grids form a power-of-two pyramid (each half the previous), so grid
     /// index `m` becomes texture mip `m` (size `pyramidSizes[m]`). Each grid has
@@ -773,8 +773,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                                            grid:           [UInt8],
                                            pyramidSizes:   [Int],
                                            pyramidOffsets: [Int],
-                                           fPerGrid:       Int,
-                                           bits:           Int) -> any MTLTexture {
+                                           fPerGrid:       Int) -> any MTLTexture {
         let kGrids = pyramidSizes.count
         precondition(fPerGrid % 4 == 0, "fPerGrid \(fPerGrid) must be a multiple of 4")
         let slices   = fPerGrid / 4
@@ -782,11 +781,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let texDesc = MTLTextureDescriptor()
         texDesc.textureType      = .type2DArray
-        switch bits {
-            case 4: texDesc.pixelFormat = .abgr4Unorm
-            case 8: texDesc.pixelFormat = .rgba8Unorm
-            default: fatalError("unsupported quantBits \(bits); expected 4 or 8")
-        }
+        texDesc.pixelFormat      = .abgr4Unorm
         texDesc.width            = baseSize
         texDesc.height           = baseSize
         texDesc.arrayLength      = slices
@@ -794,48 +789,31 @@ final class Renderer: NSObject, MTKViewDelegate {
         texDesc.usage            = .shaderRead
         texDesc.storageMode      = .shared
         let texture = device.makeTexture(descriptor: texDesc)!
-        texture.label = "NTC.latents (\(bits)-bit)"
+        texture.label = "NTC.latents (4-bit)"
 
         for mip in 0..<kGrids {
             let width = pyramidSizes[mip]
             precondition(width == max(baseSize >> mip, 1), "grid \(mip) size \(width) is not mip \(mip) of \(baseSize); pyramid must be power-of-two")
             let gridBase = pyramidOffsets[mip]
             for slice in 0..<slices {
-                let region = MTLRegionMake2D(0, 0, width, width)
-                if bits == 4 {
-                    var texels = [UInt16](repeating: 0, count: width * width)
-                    for y in 0..<width {
-                        for x in 0..<width {
-                            let srcIndex = (y * width + x) * fPerGrid + gridBase + slice * 4
-                            let nib0 = UInt16(grid[srcIndex + 0] & 0x0F)   // -> .r (high)
-                            let nib1 = UInt16(grid[srcIndex + 1] & 0x0F)   // -> .g
-                            let nib2 = UInt16(grid[srcIndex + 2] & 0x0F)   // -> .b
-                            let nib3 = UInt16(grid[srcIndex + 3] & 0x0F)   // -> .a (low)
-                            texels[y * width + x] = (nib0 << 12) | (nib1 << 8) | (nib2 << 4) | nib3
-                        }
+                var texels = [UInt16](repeating: 0, count: width * width)
+                for y in 0..<width {
+                    for x in 0..<width {
+                        let srcIndex = (y * width + x) * fPerGrid + gridBase + slice * 4
+                        // abgr4Unorm packs the four codes into one 16-bit
+                        // texel, .r in the most significant 4 bits and .a in the least
+                        let codeR = UInt16(grid[srcIndex + 0] & 0x0F)   // bits [12,16)
+                        let codeG = UInt16(grid[srcIndex + 1] & 0x0F)   // bits [8,12)
+                        let codeB = UInt16(grid[srcIndex + 2] & 0x0F)   // bits [4,8)
+                        let codeA = UInt16(grid[srcIndex + 3] & 0x0F)   // bits [0,4)
+                        texels[y * width + x] = (codeR << 12) | (codeG << 8) | (codeB << 4) | codeA
                     }
-                    texels.withUnsafeBytes { raw in
-                        texture.replace(region: region, mipmapLevel: mip, slice: slice,
-                                        withBytes: raw.baseAddress!,
-                                        bytesPerRow: width * 2, bytesPerImage: width * width * 2)
-                    }
-                } else {
-                    var texels = [UInt8](repeating: 0, count: width * width * 4)
-                    for y in 0..<width {
-                        for x in 0..<width {
-                            let srcIndex = (y * width + x) * fPerGrid + gridBase + slice * 4
-                            let dstIndex = (y * width + x) * 4
-                            texels[dstIndex + 0] = grid[srcIndex + 0]   // .r
-                            texels[dstIndex + 1] = grid[srcIndex + 1]   // .g
-                            texels[dstIndex + 2] = grid[srcIndex + 2]   // .b
-                            texels[dstIndex + 3] = grid[srcIndex + 3]   // .a
-                        }
-                    }
-                    texels.withUnsafeBytes { raw in
-                        texture.replace(region: region, mipmapLevel: mip, slice: slice,
-                                        withBytes: raw.baseAddress!,
-                                        bytesPerRow: width * 4, bytesPerImage: width * width * 4)
-                    }
+                }
+                texels.withUnsafeBytes { raw in
+                    texture.replace(region: MTLRegionMake2D(0, 0, width, width),
+                                    mipmapLevel: mip, slice: slice,
+                                    withBytes: raw.baseAddress!,
+                                    bytesPerRow: width * 2, bytesPerImage: width * width * 2)
                 }
             }
         }
