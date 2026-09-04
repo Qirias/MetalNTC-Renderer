@@ -79,7 +79,16 @@ final class Renderer: NSObject, MTKViewDelegate {
 
 
     private var sceneColorTexture: (any MTLTexture)? = nil   // linear HDR rgb, depth in alpha
-    private var sceneDepthTexture: (any MTLTexture)? = nil   // depth test only
+    private var sceneDepthTexture: (any MTLTexture)? = nil   // depth test, then read by the decode pass
+
+    private var gbufferUvLod:   (any MTLTexture)? = nil   // uv.xy, lod, material index
+    private var gbufferNormal:  (any MTLTexture)? = nil   // world normal.xyz, tangent sign
+    private var gbufferTangent: (any MTLTexture)? = nil   // world tangent.xyz
+    private var gbufferPSO: (any MTLRenderPipelineState)? = nil
+    private var decodePSO:  (any MTLComputePipelineState)? = nil
+    /// Benchmark-mode twin of decodePSO: full-screen tensor ops decode, directly
+    /// comparable to the benchmark_fs render pass.
+    private var benchmarkDecodePSO: (any MTLComputePipelineState)? = nil
     private var historyTextures:   [any MTLTexture]  = []    // 2
     private var historyIndex = 0
     private var historyValid = false
@@ -116,6 +125,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let submeshes:    [DrawSubmesh]
 
     private let benchmark: Bool
+    private let benchmarkTensorOps: Bool
 
     var startTime: CFTimeInterval = CACurrentMediaTime()
     var aspect: Float = 1.0
@@ -123,6 +133,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let recenter: simd_float4x4
 
     private var gpuTimes: [Double] = []
+    private var lastDrawableSize = CGSize(width: 1, height: 1)
 
     private var frameIndex: UInt64 = 0
 
@@ -168,14 +179,16 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     init(view: MTKView, device: any MTLDevice, gltfURL: URL, hdrURL: URL,
-         blueNoiseURL: URL, benchmark: Bool, benchmarkNTC: URL) throws {
+         blueNoiseURL: URL, benchmark: Bool, benchmarkTensorOps: Bool,
+         benchmarkNTC: URL) throws {
         self.device = device
         self.queue  = device.makeCommandQueue()!
         self.benchmark = benchmark
+        self.benchmarkTensorOps = benchmarkTensorOps
 
         let library = try device.makeDefaultLibrary(bundle: Bundle.module)
         let vertexFunction   = library.makeFunction(name: benchmark ? "fullscreen_vs" : "mesh_vs")!
-        let fragmentFunction = library.makeFunction(name: benchmark ? "bench_fs" : "mesh_fs")!
+        let fragmentFunction = library.makeFunction(name: benchmark ? "benchmark_fs" : "mesh_fs")!
 
         let offscreenColorFormat: MTLPixelFormat = .rgba16Float
         let pipelineDesc = MTLRenderPipelineDescriptor()
@@ -200,9 +213,15 @@ final class Renderer: NSObject, MTKViewDelegate {
             self.activeVariant = 0
             self.submeshes     = []
             self.recenter      = matrix_identity_float4x4
+            if let benchmarkDecode = library.makeFunction(name: "benchmark_decode") {
+                self.benchmarkDecodePSO = try device.makeComputePipelineState(function: benchmarkDecode)
+            }
             super.init()
             self.aspect = Float(view.drawableSize.width / max(view.drawableSize.height, 1))
-            print("BENCHMARK: full-screen inference on \(benchmarkNTC.lastPathComponent)")
+            let usingTensorOps = benchmarkTensorOps && benchmarkDecodePSO != nil
+            let path = usingTensorOps ? "tensor ops (benchmark_decode)"
+                                      : "half4 per fragment (benchmark_fs)"
+            print("BENCHMARK: full-screen inference on \(benchmarkNTC.lastPathComponent) -- \(path)")
             return
         }
 
@@ -296,7 +315,20 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.resolvePSO = try device.makeComputePipelineState(
             function: library.makeFunction(name: "temporal_resolve")!)
 
-        // mesh is drawn first (clear depth 0 for reverse-z). The skybox sits at the
+        if let gbufferFunction = library.makeFunction(name: "gbuffer_fs"),
+           let decodeFunction  = library.makeFunction(name: "ntc_decode_shade") {
+            let gbufferDesc = MTLRenderPipelineDescriptor()
+            gbufferDesc.vertexFunction   = library.makeFunction(name: "mesh_vs")!
+            gbufferDesc.fragmentFunction = gbufferFunction
+            gbufferDesc.colorAttachments[0].pixelFormat = Renderer.gbufferUvLodFormat
+            gbufferDesc.colorAttachments[1].pixelFormat = Renderer.gbufferNormalFormat
+            gbufferDesc.colorAttachments[2].pixelFormat = Renderer.gbufferTangentFormat
+            gbufferDesc.depthAttachmentPixelFormat      = view.depthStencilPixelFormat
+            self.gbufferPSO = try device.makeRenderPipelineState(descriptor: gbufferDesc)
+            self.decodePSO  = try device.makeComputePipelineState(function: decodeFunction)
+        }
+
+        // mesh is drawn first (clear depth 0 for reverse-z); the skybox sits at the
         // far plane (z = 0) and tests equal so it survives only on pixels the mesh left
         // at the cleared depth.
         let skyDepthDesc = MTLDepthStencilDescriptor()
@@ -312,10 +344,18 @@ final class Renderer: NSObject, MTKViewDelegate {
         print("loaded \(draws.count) submesh(es), \(materialNames.count) material(s); qualities: \(qualityList)")
     }
 
+    fileprivate static let gbufferUvLodFormat:   MTLPixelFormat = .rgba32Float
+    fileprivate static let gbufferNormalFormat:  MTLPixelFormat = .rgba16Float
+    fileprivate static let gbufferTangentFormat: MTLPixelFormat = .rgba16Float
+
+
+    fileprivate static let decodeTileSide = 8
+    fileprivate static let decodeTileThreads = 128
+
     private func allocateTargets(width: Int, height: Int) {
         let colorDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float,
                                                                 width: width, height: height, mipmapped: false)
-        colorDesc.usage = [.renderTarget, .shaderRead]
+        colorDesc.usage = [.renderTarget, .shaderRead, .shaderWrite]
         colorDesc.storageMode = .private
         let sceneColor = device.makeTexture(descriptor: colorDesc)!
         sceneColor.label = "sceneColor (linear HDR)"
@@ -323,11 +363,25 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let depthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
                                                                 width: width, height: height, mipmapped: false)
-        depthDesc.usage = [.renderTarget]
+        depthDesc.usage = [.renderTarget, .shaderRead]
         depthDesc.storageMode = .private
         let sceneDepth = device.makeTexture(descriptor: depthDesc)!
         sceneDepth.label = "sceneDepth"
         self.sceneDepthTexture = sceneDepth
+
+        func makeGBuffer(_ format: MTLPixelFormat, _ label: String) -> any MTLTexture {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format,
+                                                               width: width, height: height,
+                                                               mipmapped: false)
+            desc.usage = [.renderTarget, .shaderRead]
+            desc.storageMode = .private
+            let texture = device.makeTexture(descriptor: desc)!
+            texture.label = label
+            return texture
+        }
+        self.gbufferUvLod   = makeGBuffer(Renderer.gbufferUvLodFormat,   "gbuffer uv/lod/material")
+        self.gbufferNormal  = makeGBuffer(Renderer.gbufferNormalFormat,  "gbuffer normal")
+        self.gbufferTangent = makeGBuffer(Renderer.gbufferTangentFormat, "gbuffer tangent")
 
         let histDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float,
                                                                width: width, height: height, mipmapped: false)
@@ -523,7 +577,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             let position = submesh.positions[i]
             let normal   = i < submesh.normals.count ? submesh.normals[i] : SIMD3<Float>(0, 1, 0)
             let uv       = i < submesh.uvs.count     ? submesh.uvs[i]     : SIMD2<Float>(0, 0)
-            // Zero tangent (w = 0) signals "no TANGENT" to the shader.
+            // zero tangent (w = 0)
             let tangent  = i < submesh.tangents.count ? submesh.tangents[i] : SIMD4<Float>(0, 0, 0, 0)
             vertices.append(MeshVertex(px: position.x, py: position.y, pz: position.z,
                                        nx: normal.x,   ny: normal.y,   nz: normal.z,
@@ -544,12 +598,35 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     func draw(in view: MTKView) {
         guard let drawable = view.currentDrawable else { return }
+        lastDrawableSize = view.drawableSize
 
         let commandBuffer = queue.makeCommandBuffer()!
         var frame = UInt32(truncatingIfNeeded: frameIndex)
         var flags: UInt32 = stochasticLOD ? RenderFlags.stochasticLOD : 0
 
-        if benchmark {
+        if benchmark, benchmarkTensorOps, let benchmarkDecodePSO = benchmarkDecodePSO {
+            var resource = ntcVariants[activeVariant].resources[0]
+            let target = drawable.texture
+            let encoder = commandBuffer.makeComputeCommandEncoder()!
+            encoder.setComputePipelineState(benchmarkDecodePSO)
+            encoder.setTexture(resource.latentTexture, index: 0)
+            encoder.setTexture(blueNoise!, index: 4)
+            encoder.setTexture(target,     index: 9)
+            encoder.setBuffer(resource.mlpBuffer,    offset: 0, index: 1)
+            encoder.setBuffer(resource.constsBuffer, offset: 0, index: 2)
+            encoder.setBytes(&resource.materialLayout,
+                             length: MemoryLayout<MaterialLayout>.stride, index: 3)
+            encoder.setBytes(&resource.gridDequant,
+                             length: MemoryLayout<SIMD2<Float>>.stride,   index: 4)
+            encoder.setBytes(&frame, length: MemoryLayout<UInt32>.stride, index: 5)
+            encoder.setBytes(&flags, length: MemoryLayout<UInt32>.stride, index: 7)
+            let side = Renderer.decodeTileSide
+            encoder.dispatchThreadgroups(
+                MTLSize(width:  (target.width  + side - 1) / side,
+                        height: (target.height + side - 1) / side, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: Renderer.decodeTileThreads, height: 1, depth: 1))
+            encoder.endEncoding()
+        } else if benchmark {
             guard let renderPassDesc = view.currentRenderPassDescriptor else { return }
             let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc)!
             encoder.setRenderPipelineState(meshPSO)
@@ -557,13 +634,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             var resource = ntcVariants[activeVariant].resources[0]
             encoder.setCullMode(.none)
             encoder.setFragmentTexture(resource.latentTexture, index: 0)
-            encoder.setFragmentTexture(blueNoise!,            index: 4)
+            encoder.setFragmentTexture(blueNoise!,             index: 4)
             encoder.setFragmentBuffer(resource.mlpBuffer,    offset: 0, index: 1)
             encoder.setFragmentBuffer(resource.constsBuffer, offset: 0, index: 2)
             encoder.setFragmentBytes(&resource.materialLayout,
                                      length: MemoryLayout<MaterialLayout>.stride, index: 3)
             encoder.setFragmentBytes(&resource.gridDequant,
-                                     length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
+                                     length: MemoryLayout<SIMD2<Float>>.stride,   index: 4)
             encoder.setFragmentBytes(&frame, length: MemoryLayout<UInt32>.stride, index: 5)
             encoder.setFragmentBytes(&flags, length: MemoryLayout<UInt32>.stride, index: 7)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
@@ -587,62 +664,178 @@ final class Renderer: NSObject, MTKViewDelegate {
                                                            aspect, 0.1, 100.0)
             let viewProj = projMatrix * viewMatrix
 
-            // pass 1: mesh + skybox into the offscreen linear-HDR buffer
-            let passDesc = MTLRenderPassDescriptor()
-            passDesc.colorAttachments[0].texture     = sceneColor
-            passDesc.colorAttachments[0].loadAction  = .clear
-            passDesc.colorAttachments[0].clearColor  = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-            passDesc.colorAttachments[0].storeAction = .store
-            passDesc.depthAttachment.texture     = sceneDepth
-            passDesc.depthAttachment.loadAction  = .clear
-            passDesc.depthAttachment.clearDepth  = 0.0
-            passDesc.depthAttachment.storeAction = .dontCare
-            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDesc)!
-
-            encoder.setRenderPipelineState(meshPSO)
-            encoder.setDepthStencilState(depthState)
-            encoder.setCullMode(.back)
-            encoder.setFrontFacing(.counterClockwise)
-
-            var camPos = camEye
-            for submesh in submeshes {
-                let model = spin * recenter * submesh.transform
-                var uniforms = MeshUniforms(mvp: viewProj * model,
-                                            model: model,
-                                            normalMatrix: matrix_inverse_transpose(model))
-                var resource = ntcVariants[activeVariant].resources[submesh.ntcIndex]   // value copy; setFragmentBytes needs inout
-
-                encoder.setVertexBuffer(submesh.vertexBuffer, offset: 0, index: 0)
-                encoder.setVertexBytes(&uniforms, length: MemoryLayout<MeshUniforms>.stride, index: 1)
-                encoder.setFragmentTexture(resource.latentTexture, index: 0)
-                encoder.setFragmentTexture(irradianceMap!, index: 1)
-                encoder.setFragmentTexture(radianceMap!,   index: 2)
-                encoder.setFragmentTexture(brdfLut!,       index: 3)
-                encoder.setFragmentTexture(blueNoise!,     index: 4)
-                encoder.setFragmentBuffer(resource.mlpBuffer,    offset: 0, index: 1)
-                encoder.setFragmentBuffer(resource.constsBuffer, offset: 0, index: 2)
-                encoder.setFragmentBytes(&resource.materialLayout,
-                                         length: MemoryLayout<MaterialLayout>.stride, index: 3)
-                encoder.setFragmentBytes(&resource.gridDequant,
-                                         length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
-                encoder.setFragmentBytes(&frame, length: MemoryLayout<UInt32>.stride, index: 5)
-                encoder.setFragmentBytes(&camPos, length: MemoryLayout<SIMD3<Float>>.stride, index: 6)
-                encoder.setFragmentBytes(&flags, length: MemoryLayout<UInt32>.stride, index: 7)
-                encoder.drawIndexedPrimitives(type: .triangle,
-                                              indexCount: submesh.indexCount,
-                                              indexType: .uint32,
-                                              indexBuffer: submesh.indexBuffer,
-                                              indexBufferOffset: 0)
-            }
-
-            encoder.setRenderPipelineState(skyboxPSO!)
-            encoder.setDepthStencilState(skyboxDepthState!)
-            encoder.setCullMode(.none)
             var invViewProj = simd_inverse(viewProj)
-            encoder.setFragmentTexture(environmentCubemap!, index: 0)
-            encoder.setFragmentBytes(&invViewProj, length: MemoryLayout<simd_float4x4>.stride, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-            encoder.endEncoding()
+            var camPos = camEye
+
+            if let gbufferUvLod = gbufferUvLod,
+               let gbufferNormal = gbufferNormal,
+               let gbufferTangent = gbufferTangent,
+               let gbufferPSO = gbufferPSO,
+               let decodePSO = decodePSO {
+
+                // pass 1: geometry into the G-buffer
+                let gbufferDesc = MTLRenderPassDescriptor()
+                gbufferDesc.colorAttachments[0].texture     = gbufferUvLod
+                gbufferDesc.colorAttachments[0].loadAction  = .clear
+                // material index -1 marks a pixel with no geometry
+                gbufferDesc.colorAttachments[0].clearColor  = MTLClearColor(red: 0, green: 0, blue: 0, alpha: -1)
+                gbufferDesc.colorAttachments[0].storeAction = .store
+                gbufferDesc.colorAttachments[1].texture     = gbufferNormal
+                gbufferDesc.colorAttachments[1].loadAction  = .clear
+                gbufferDesc.colorAttachments[1].clearColor  = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+                gbufferDesc.colorAttachments[1].storeAction = .store
+                gbufferDesc.colorAttachments[2].texture     = gbufferTangent
+                gbufferDesc.colorAttachments[2].loadAction  = .clear
+                gbufferDesc.colorAttachments[2].clearColor  = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+                gbufferDesc.colorAttachments[2].storeAction = .store
+                gbufferDesc.depthAttachment.texture     = sceneDepth
+                gbufferDesc.depthAttachment.loadAction  = .clear
+                gbufferDesc.depthAttachment.clearDepth  = 0.0
+                // the decode pass reads this back for the world position
+                gbufferDesc.depthAttachment.storeAction = .store
+
+                let geometry = commandBuffer.makeRenderCommandEncoder(descriptor: gbufferDesc)!
+                geometry.setRenderPipelineState(gbufferPSO)
+                geometry.setDepthStencilState(depthState)
+                geometry.setCullMode(.back)
+                geometry.setFrontFacing(.counterClockwise)
+
+                for submesh in submeshes {
+                    let model = spin * recenter * submesh.transform
+                    var uniforms = MeshUniforms(mvp: viewProj * model,
+                                                model: model,
+                                                normalMatrix: matrix_inverse_transpose(model))
+                    let resource = ntcVariants[activeVariant].resources[submesh.ntcIndex]
+                    var materialIndex = UInt32(submesh.ntcIndex)
+
+                    geometry.setVertexBuffer(submesh.vertexBuffer, offset: 0, index: 0)
+                    geometry.setVertexBytes(&uniforms, length: MemoryLayout<MeshUniforms>.stride, index: 1)
+                    geometry.setFragmentTexture(blueNoise!, index: 4)
+                    geometry.setFragmentBuffer(resource.constsBuffer, offset: 0, index: 2)
+                    geometry.setFragmentBytes(&frame, length: MemoryLayout<UInt32>.stride, index: 5)
+                    geometry.setFragmentBytes(&flags, length: MemoryLayout<UInt32>.stride, index: 7)
+                    geometry.setFragmentBytes(&materialIndex, length: MemoryLayout<UInt32>.stride, index: 8)
+                    geometry.drawIndexedPrimitives(type: .triangle,
+                                                   indexCount: submesh.indexCount,
+                                                   indexType: .uint32,
+                                                   indexBuffer: submesh.indexBuffer,
+                                                   indexBufferOffset: 0)
+                }
+                geometry.endEncoding()
+
+                // pass 2: skybox fills the background; depth is loaded from pass 1
+                // and tested equal, so it survives only where no geometry drew
+                let skyDesc = MTLRenderPassDescriptor()
+                skyDesc.colorAttachments[0].texture     = sceneColor
+                skyDesc.colorAttachments[0].loadAction  = .clear
+                skyDesc.colorAttachments[0].clearColor  = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+                skyDesc.colorAttachments[0].storeAction = .store
+                skyDesc.depthAttachment.texture     = sceneDepth
+                skyDesc.depthAttachment.loadAction  = .load
+                skyDesc.depthAttachment.storeAction = .store
+
+                let sky = commandBuffer.makeRenderCommandEncoder(descriptor: skyDesc)!
+                sky.setRenderPipelineState(skyboxPSO!)
+                sky.setDepthStencilState(skyboxDepthState!)
+                sky.setCullMode(.none)
+                sky.setFragmentTexture(environmentCubemap!, index: 0)
+                sky.setFragmentBytes(&invViewProj, length: MemoryLayout<simd_float4x4>.stride, index: 0)
+                sky.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                sky.endEncoding()
+
+                // pass 3: tensor ops NTC decode + shading, one dispatch per material;
+                // a threadgroup covers one tile and shares one MLP, so the tile can
+                // only be decoded with one material's weights at a time; tiles with
+                // no pixel of the current material exit before the matmul
+                let decode = commandBuffer.makeComputeCommandEncoder()!
+                decode.setComputePipelineState(decodePSO)
+                let tileSide = Renderer.decodeTileSide
+                let tileCount = MTLSize(width:  (sceneColor.width  + tileSide - 1) / tileSide,
+                                        height: (sceneColor.height + tileSide - 1) / tileSide,
+                                        depth: 1)
+                let tileThreads = MTLSize(width: Renderer.decodeTileThreads, height: 1, depth: 1)
+
+                decode.setTexture(gbufferUvLod,   index: 5)
+                decode.setTexture(gbufferNormal,  index: 6)
+                decode.setTexture(gbufferTangent, index: 7)
+                decode.setTexture(sceneDepth,     index: 8)
+                decode.setTexture(sceneColor,     index: 9)
+                decode.setTexture(irradianceMap!, index: 1)
+                decode.setTexture(radianceMap!,   index: 2)
+                decode.setTexture(brdfLut!,       index: 3)
+                decode.setBytes(&camPos,      length: MemoryLayout<SIMD3<Float>>.stride, index: 6)
+                decode.setBytes(&invViewProj, length: MemoryLayout<simd_float4x4>.stride, index: 9)
+
+                for (materialIndex, resource) in ntcVariants[activeVariant].resources.enumerated() {
+                    var resource = resource// setBytes needs inout
+                    var index = UInt32(materialIndex)
+                    decode.setTexture(resource.latentTexture, index: 0)
+                    decode.setBuffer(resource.mlpBuffer,    offset: 0, index: 1)
+                    decode.setBuffer(resource.constsBuffer, offset: 0, index: 2)
+                    decode.setBytes(&resource.materialLayout,
+                                    length: MemoryLayout<MaterialLayout>.stride, index: 3)
+                    decode.setBytes(&resource.gridDequant,
+                                    length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
+                    decode.setBytes(&index, length: MemoryLayout<UInt32>.stride, index: 8)
+                    decode.dispatchThreadgroups(tileCount, threadsPerThreadgroup: tileThreads)
+                }
+                decode.endEncoding()
+            } else {
+                // no tensor ops: one MLP per fragment
+                let passDesc = MTLRenderPassDescriptor()
+                passDesc.colorAttachments[0].texture     = sceneColor
+                passDesc.colorAttachments[0].loadAction  = .clear
+                passDesc.colorAttachments[0].clearColor  = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+                passDesc.colorAttachments[0].storeAction = .store
+                passDesc.depthAttachment.texture     = sceneDepth
+                passDesc.depthAttachment.loadAction  = .clear
+                passDesc.depthAttachment.clearDepth  = 0.0
+                passDesc.depthAttachment.storeAction = .dontCare
+                let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDesc)!
+
+                encoder.setRenderPipelineState(meshPSO)
+                encoder.setDepthStencilState(depthState)
+                encoder.setCullMode(.back)
+                encoder.setFrontFacing(.counterClockwise)
+
+                for submesh in submeshes {
+                    let model = spin * recenter * submesh.transform
+                    var uniforms = MeshUniforms(mvp: viewProj * model,
+                                                model: model,
+                                                normalMatrix: matrix_inverse_transpose(model))
+                    var resource = ntcVariants[activeVariant].resources[submesh.ntcIndex] // value copy; setFragmentBytes needs inout
+
+                    encoder.setVertexBuffer(submesh.vertexBuffer, offset: 0, index: 0)
+                    encoder.setVertexBytes(&uniforms, length: MemoryLayout<MeshUniforms>.stride, index: 1)
+                    encoder.setFragmentTexture(resource.latentTexture, index: 0)
+                    encoder.setFragmentTexture(irradianceMap!, index: 1)
+                    encoder.setFragmentTexture(radianceMap!,   index: 2)
+                    encoder.setFragmentTexture(brdfLut!,       index: 3)
+                    encoder.setFragmentTexture(blueNoise!,     index: 4)
+                    encoder.setFragmentBuffer(resource.mlpBuffer,    offset: 0, index: 1)
+                    encoder.setFragmentBuffer(resource.constsBuffer, offset: 0, index: 2)
+                    encoder.setFragmentBytes(&resource.materialLayout,
+                                             length: MemoryLayout<MaterialLayout>.stride, index: 3)
+                    encoder.setFragmentBytes(&resource.gridDequant,
+                                             length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
+                    encoder.setFragmentBytes(&frame, length: MemoryLayout<UInt32>.stride, index: 5)
+                    encoder.setFragmentBytes(&camPos, length: MemoryLayout<SIMD3<Float>>.stride, index: 6)
+                    encoder.setFragmentBytes(&flags, length: MemoryLayout<UInt32>.stride, index: 7)
+                    encoder.drawIndexedPrimitives(type: .triangle,
+                                                  indexCount: submesh.indexCount,
+                                                  indexType: .uint32,
+                                                  indexBuffer: submesh.indexBuffer,
+                                                  indexBufferOffset: 0)
+                }
+
+                encoder.setRenderPipelineState(skyboxPSO!)
+                encoder.setDepthStencilState(skyboxDepthState!)
+                encoder.setCullMode(.none)
+                encoder.setFragmentTexture(environmentCubemap!, index: 0)
+                encoder.setFragmentBytes(&invViewProj, length: MemoryLayout<simd_float4x4>.stride, index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                encoder.endEncoding()
+            }
 
             // pass 2: temporal resolve
             let readIdx  = historyIndex

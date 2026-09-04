@@ -1,23 +1,12 @@
 import Foundation
 import simd
 
-/// Reads what the renderer draws: every mesh primitive's positions, normals,
-/// uvs and indices, each with its world transform (accumulated down the node
-/// hierarchy) and glTF material name. It ignores animations, skins, cameras.
-/// Material textures are not read here -- those come from the .ntc payload,
-/// whose channel layout is described by the manifest.json beside the .gltf.
 struct GLTF {
-
-    /// One drawable primitive with its world-space transform (accumulated down
-    /// the node hierarchy) and its glTF material name; the renderer loads
-    /// `<materialName>.ntc` beside the glTF.
     struct Submesh {
         var positions: [SIMD3<Float>]
         var normals:   [SIMD3<Float>]
         var uvs:       [SIMD2<Float>]
-        /// glTF TANGENT is a VEC4: xyz is the tangent, w is the handedness sign
-        /// (+1/-1) for reconstructing the bitangent. Empty when the primitive
-        /// has no TANGENT -- the shader then falls back to the geometric normal.
+        /// when the primitive has no tangent, the shader falls back to the geometric normal
         var tangents:  [SIMD4<Float>]
         var indices:   [UInt32]
         var transform: simd_float4x4
@@ -99,8 +88,7 @@ struct GLTF {
         let baseDir = url.deletingLastPathComponent()
         let bufferData = try loadBufferData(doc, baseDir)
 
-        // Depth-first from the scene roots, accumulating each node's transform.
-        // Bad indices trap on the array access; that is the "crash if malformed".
+        // depth-first from the scene roots, accumulating each node's transform
         var submeshes: [Submesh] = []
         func visit(_ nodeIdx: Int, _ parent: simd_float4x4) throws {
             let node  = doc.nodes[nodeIdx]
@@ -125,8 +113,7 @@ struct GLTF {
         return Scene(submeshes: submeshes)
     }
 
-    // Resolve external .bin buffers. GLB and base64 data: URIs are rejected
-    // rather than silently mis-parsed.
+    // resolve external .bin buffers
     private static func loadBufferData(_ doc: Doc, _ baseDir: URL) throws -> [Data] {
         var bufferData: [Data] = []
         for buffer in doc.buffers {
@@ -154,7 +141,7 @@ struct GLTF {
             normals = [SIMD3<Float>](repeating: SIMD3<Float>(0, 1, 0), count: positions.count)
         }
 
-        // TANGENT is optional; left empty when absent so the shader can fall back.
+        // TANGENT is optional
         let tangents: [SIMD4<Float>]
         if let tanIdx = prim.attributes["TANGENT"] {
             tangents = try readVec4(doc, bufferData, tanIdx)
@@ -174,7 +161,7 @@ struct GLTF {
     // MARK: node transform
 
     private static func transform(of node: Doc.Node) -> simd_float4x4 {
-        // A node has either `matrix` (column-major, matching simd) or T/R/S.
+        // a node has either `matrix` (column-major, matching simd) or T/R/S.
         if let m = node.matrix {
             return simd_float4x4(SIMD4<Float>(m[0],  m[1],  m[2],  m[3]),
                                  SIMD4<Float>(m[4],  m[5],  m[6],  m[7]),
@@ -182,13 +169,13 @@ struct GLTF {
                                  SIMD4<Float>(m[12], m[13], m[14], m[15]))
         }
 
-        // Compose T * R * S, per the glTF spec's stated order.
+        // compose T * R * S, per the glTF spec's stated order.
         var out = matrix_identity_float4x4
         if let t = node.translation {
             out.columns.3 = SIMD4<Float>(t[0], t[1], t[2], 1)
         }
         if let r = node.rotation {
-            // glTF quaternions are (x, y, z, w), matching simd_quatf's storage.
+            // glTF quaternions are (x, y, z, w), matching simd_quatf's storage
             out = out * simd_float4x4(simd_quatf(ix: r[0], iy: r[1], iz: r[2], r: r[3]))
         }
         if let s = node.scale {

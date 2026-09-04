@@ -43,7 +43,7 @@ struct VertexOut {
     float2 uv;
 };
 
-struct BenchOut {
+struct BenchmarkOut {
     float4 position [[position]];
     float2 uv;
 };
@@ -62,9 +62,9 @@ vertex VertexOut mesh_vs(uint                      vertexID [[vertex_id]],
     return output;
 }
 
-vertex BenchOut fullscreen_vs(uint vertexID [[vertex_id]]) {
+vertex BenchmarkOut fullscreen_vs(uint vertexID [[vertex_id]]) {
     float2 uv = float2(float((vertexID << 1) & 2), float(vertexID & 2));
-    BenchOut output;
+    BenchmarkOut output;
     output.position = float4(uv * 2.0 - 1.0, 1.0, 1.0);
     output.uv       = uv;
     return output;
@@ -89,14 +89,9 @@ constexpr sampler brdfSampler(filter::linear, address::clamp_to_edge);
 
 #define RENDER_FLAG_STOCHASTIC_LOD  (1u << 0)
 
-static inline uint select_lod(float2 uv, float2 pixelCoord, uint frameIndex,
-                              bool stochastic, texture2d<float> blueNoise,
-                              constant StepConstants& consts) {
-    float2 dx = dfdx(uv) * float(consts.srcW);
-    float2 dy = dfdy(uv) * float(consts.srcH);
-    float lodf = clamp(0.5 * log2(max(dot(dx, dx), dot(dy, dy))),
-                       0.0, float(consts.mipCount - 1));
-
+static inline uint quantize_lod(float lodf, float2 pixelCoord, uint frameIndex,
+                                bool stochastic, texture2d<float> blueNoise,
+                                constant StepConstants& consts) {
     if (stochastic) {
         float base = floor(lodf);
         float frac = lodf - base;
@@ -113,17 +108,17 @@ static inline uint select_lod(float2 uv, float2 pixelCoord, uint frameIndex,
     return uint(round(lodf));
 }
 
-static Material sample_material(float2                   uv,
-                                uint                     lod,
-                                texture2d_array<float>   latents,
-                                float2                   gridDequant,
-                                device const half*       mlp,
-                                constant StepConstants&  consts,
-                                constant MaterialLayout& layout) {
-    half pred[K_OUT_MAX];
-    ntc_decode_quant(uv, lod, latents, latentSampler,
-                     gridDequant.x, gridDequant.y, mlp, consts, pred);
+static inline uint select_lod(float2 uv, float2 pixelCoord, uint frameIndex,
+                              bool stochastic, texture2d<float> blueNoise,
+                              constant StepConstants& consts) {
+    float2 dx = dfdx(uv) * float(consts.srcW);
+    float2 dy = dfdy(uv) * float(consts.srcH);
+    float lodf = clamp(0.5 * log2(max(dot(dx, dx), dot(dy, dy))),
+                       0.0, float(consts.mipCount - 1));
+    return quantize_lod(lodf, pixelCoord, frameIndex, stochastic, blueNoise, consts);
+}
 
+static Material unpack_material(thread const half* pred, constant MaterialLayout& layout) {
     Material m;
     m.albedo    = read3(pred, layout.albedo,    float3(0.5));
     m.roughness = read1(pred, layout.roughness, 1.0);
@@ -135,6 +130,66 @@ static Material sample_material(float2                   uv,
     m.normal = packedN * 2.0 - 1.0;
 
     return m;
+}
+
+static Material sample_material(float2                   uv,
+                                uint                     lod,
+                                texture2d_array<float>   latents,
+                                float2                   gridDequant,
+                                device const half*       mlp,
+                                constant StepConstants&  consts,
+                                constant MaterialLayout& layout) {
+    half pred[K_OUT_MAX];
+    ntc_decode_quant(uv, lod, latents, latentSampler,
+                     gridDequant.x, gridDequant.y, mlp, consts, pred);
+    return unpack_material(pred, layout);
+}
+
+
+static float3 shade_material(Material           material,
+                             float3             worldPos,
+                             float3             worldNormal,
+                             float3             worldTangent,
+                             float              tangentSign,
+                             float3             cameraPos,
+                             texturecube<float> irradianceMap,
+                             texturecube<float> radianceMap,
+                             texture2d<float>   brdfLut) {
+    float3 geometricNormal = normalize(worldNormal);
+    float3 shadingNormal;
+    if (abs(tangentSign) < 0.5 || length(worldTangent) < 1e-4) {
+        shadingNormal = geometricNormal;
+    } else {
+        float3 tangent   = normalize(worldTangent - geometricNormal * dot(geometricNormal, worldTangent));
+        float3 bitangent = cross(geometricNormal, tangent) * tangentSign;
+        shadingNormal    = normalize(float3x3(tangent, bitangent, geometricNormal) * material.normal);
+    }
+
+    float3 albedo    = srgbToLinear(material.albedo);
+    float3 emissive  = srgbToLinear(material.emissive);
+    float  roughness = clamp(material.roughness, 0.045, 1.0);
+    float  metalness = clamp(material.metalness, 0.0, 1.0);
+
+    float3 viewDir    = normalize(cameraPos - worldPos);
+    float3 reflectDir = reflect(-viewDir, shadingNormal);
+    float  NdotV      = max(dot(shadingNormal, viewDir), 0.0);
+
+    float3 baseReflectance = mix(float3(0.04), albedo, metalness);
+    float3 fresnel         = fresnelSchlickRoughness(NdotV, baseReflectance, roughness);
+    float3 diffuseWeight   = (1.0 - fresnel) * (1.0 - metalness);
+
+    // diffuse
+    float3 irradiance = irradianceMap.sample(iblSampler, shadingNormal).rgb;
+    float3 diffuse    = irradiance * albedo;
+
+    // specular
+    const float MAX_REFLECTION_LOD = 9.0;
+    float3 prefiltered = radianceMap.sample(iblSampler, reflectDir, level(roughness * roughness * MAX_REFLECTION_LOD)).rgb;
+    float2 brdf        = brdfLut.sample(brdfSampler, float2(NdotV, roughness)).rg;
+    float3 specular    = prefiltered * (fresnel * brdf.x + brdf.y);
+
+    float3 ambient = (diffuseWeight * diffuse + specular) * material.occlusion;
+    return ambient + emissive;
 }
 
 fragment float4 mesh_fs(VertexOut                  in          [[stage_in]],
@@ -155,47 +210,15 @@ fragment float4 mesh_fs(VertexOut                  in          [[stage_in]],
                           blueNoise, consts);
     Material material = sample_material(in.uv, lod, latents, gridDequant, mlp, consts, layout);
 
-    float3 geometricNormal = normalize(in.worldNormal);
-    float3 shadingNormal;
-    if (abs(in.tangentSign) < 0.5 || length(in.worldTangent) < 1e-4) {
-        shadingNormal = geometricNormal;
-    } else {
-        float3 tangent   = normalize(in.worldTangent - geometricNormal * dot(geometricNormal, in.worldTangent));
-        float3 bitangent = cross(geometricNormal, tangent) * in.tangentSign;
-        shadingNormal    = normalize(float3x3(tangent, bitangent, geometricNormal) * material.normal);
-    }
-
-    float3 albedo    = srgbToLinear(material.albedo);
-    float3 emissive  = srgbToLinear(material.emissive);
-    float  roughness = clamp(material.roughness, 0.045, 1.0);
-    float  metalness = clamp(material.metalness, 0.0, 1.0);
-
-    float3 viewDir    = normalize(cameraPos - in.worldPos);
-    float3 reflectDir = reflect(-viewDir, shadingNormal);
-    float  NdotV      = max(dot(shadingNormal, viewDir), 0.0);
-
-    float3 baseReflectance = mix(float3(0.04), albedo, metalness);
-    float3 fresnel         = fresnelSchlickRoughness(NdotV, baseReflectance, roughness);
-    float3 diffuseWeight   = (1.0 - fresnel) * (1.0 - metalness);
-
-    // diffuse
-    float3 irradiance = irradianceMap.sample(iblSampler, shadingNormal).rgb;
-    float3 diffuse    = irradiance * albedo;
-
-    // specular
-    const float MAX_REFLECTION_LOD = 9.0;
-    float3 prefiltered = radianceMap.sample(iblSampler, reflectDir, level(roughness * roughness * MAX_REFLECTION_LOD)).rgb;
-    float2 brdf        = brdfLut.sample(brdfSampler, float2(NdotV, roughness)).rg;
-    float3 specular    = prefiltered * (fresnel * brdf.x + brdf.y);
-
-    float3 ambient = (diffuseWeight * diffuse + specular) * material.occlusion;
-    float3 color   = ambient + emissive;
+    float3 color = shade_material(material, in.worldPos, in.worldNormal,
+                                  in.worldTangent, in.tangentSign, cameraPos,
+                                  irradianceMap, radianceMap, brdfLut);
 
     // output linear HDR into the offscreen buffer; the temporal resolve pass tone-maps
     return float4(color, in.position.z);
 }
 
-fragment float4 bench_fs(BenchOut                   in          [[stage_in]],
+fragment float4 benchmark_fs(BenchmarkOut                   in          [[stage_in]],
                          texture2d_array<float>     latents     [[texture(0)]],
                          texture2d<float>           blueNoise   [[texture(4)]],
                          device const half*         mlp         [[buffer(1)]],
@@ -211,3 +234,198 @@ fragment float4 bench_fs(BenchOut                   in          [[stage_in]],
     float3 color = material.albedo + material.emissive;
     return float4(clamp(color, 0.0, 1.0), 1.0);
 }
+
+#ifdef NTC_TENSOR_OPS
+
+struct GBufferOut {
+    float4 uvLodMaterial [[color(0)]];  // uv.xy, lod, material index (-1 = no geometry)
+    float4 normalSign    [[color(1)]];  // world normal.xyz, tangent sign
+    float4 tangent       [[color(2)]];  // world tangent.xyz, unused
+};
+
+fragment GBufferOut gbuffer_fs(VertexOut               in            [[stage_in]],
+                               texture2d<float>        blueNoise     [[texture(4)]],
+                               constant StepConstants& consts        [[buffer(2)]],
+                               constant uint&          frameIndex    [[buffer(5)]],
+                               constant uint&          renderFlags   [[buffer(7)]],
+                               constant uint&          materialIndex [[buffer(8)]]) {
+    // select_lod needs screen-space derivatives, it can't be computed
+    // efficiently in the compute pass
+    uint lod = select_lod(in.uv, in.position.xy, frameIndex,
+                          (renderFlags & RENDER_FLAG_STOCHASTIC_LOD) != 0u,
+                          blueNoise, consts);
+
+    GBufferOut out;
+    out.uvLodMaterial = float4(in.uv, float(lod), float(materialIndex));
+    out.normalSign    = float4(in.worldNormal, in.tangentSign);
+    out.tangent       = float4(in.worldTangent, 0.0);
+    return out;
+}
+
+// dispatching 128 threads for 64 pixels means there are idle threads;
+// but execution_simdgroups<4> means four simdgroups and all 128 lanes must reach
+// the matmul, because the cooperative tensor is distributed across all their
+// registers; execution_simdgroups<2> would give a 1:1 mapping and measured 2% SLOWER
+#define DECODE_TILE_SIDE 8
+
+static inline float3 world_position_from_depth(float2 ndc, float depth, float4x4 invViewProj) {
+    float4 world = invViewProj * float4(ndc, depth, 1.0);
+    return world.xyz / world.w;
+}
+
+kernel void ntc_decode_shade(texture2d<float>                gbufferUvLod   [[texture(5)]],
+                             texture2d<float>                gbufferNormal  [[texture(6)]],
+                             texture2d<float>                gbufferTangent [[texture(7)]],
+                             depth2d<float>                  gbufferDepth   [[texture(8)]],
+                             texture2d<float, access::write> sceneColor     [[texture(9)]],
+                             texture2d_array<float>          latents        [[texture(0)]],
+                             texturecube<float>              irradianceMap  [[texture(1)]],
+                             texturecube<float>              radianceMap    [[texture(2)]],
+                             texture2d<float>                brdfLut        [[texture(3)]],
+                             device const half*              mlp            [[buffer(1)]],
+                             constant StepConstants&         consts         [[buffer(2)]],
+                             constant MaterialLayout&        layout         [[buffer(3)]],
+                             constant float2&                gridDequant    [[buffer(4)]],
+                             constant float3&                cameraPos      [[buffer(6)]],
+                             constant uint&                  materialIndex  [[buffer(8)]],
+                             constant float4x4&              invViewProj    [[buffer(9)]],
+                             uint2 tgid [[threadgroup_position_in_grid]],
+                             uint  tid  [[thread_index_in_threadgroup]]) {
+    threadgroup half features[TILE_SIZE * F_IN];
+    threadgroup half hidden  [TILE_SIZE * K_HIDDEN];
+    threadgroup half pred    [TILE_SIZE * K_OUT_MAX];
+    threadgroup atomic_uint tileUsesThisMaterial;
+
+    uint2 tileOrigin = tgid * DECODE_TILE_SIDE;
+    uint2 screenSize = uint2(gbufferUvLod.get_width(), gbufferUvLod.get_height());
+
+    if (tid == 0) {
+        atomic_store_explicit(&tileUsesThisMaterial, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // tid < TILE_SIZE has no pixel but will still be used by the cooperative tensor
+    uint2  pixel    = tileOrigin + uint2(tid % DECODE_TILE_SIDE, tid / DECODE_TILE_SIDE);
+    bool   hasPixel = tid < TILE_SIZE && pixel.x < screenSize.x && pixel.y < screenSize.y;
+    float4 uvLodMaterial = hasPixel ? gbufferUvLod.read(pixel) : float4(0, 0, 0, -1);
+
+    bool pixelUsesThisMaterial = uvLodMaterial.w == float(materialIndex);
+    if (pixelUsesThisMaterial) {
+        atomic_store_explicit(&tileUsesThisMaterial, 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // mlp_forward_tensor_ops is cooperative and all TILE_THREADS
+    // lanes have to reach it, so a per-thread "if (!pixelUsesThisMaterial) return;"
+    // would be wrong
+    if (atomic_load_explicit(&tileUsesThisMaterial, memory_order_relaxed) == 0u) {
+        return;
+    }
+
+    // Every row is filled, including pixels belonging to other materials;
+    // their results are simply not written out because it gets caught
+    // by "if (!pixelUsesThisMaterial)"
+    if (tid < TILE_SIZE) {
+        half row[F_IN];
+        ntc_build_features(uvLodMaterial.xy,
+                           uint(max(uvLodMaterial.z, 0.0)),
+                           latents,
+                           latentSampler,
+                           gridDequant.x, gridDequant.y,
+                           consts, row);
+        for (uint i = 0; i < F_IN; i++) {
+            features[tid * F_IN + i] = row[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    mlp_forward_tensor_ops(mlp,
+                           consts.offsetW1, consts.offsetB1,
+                           consts.offsetW2, consts.offsetB2,
+                           consts.offsetW3, consts.offsetB3,
+                           features, hidden, pred);
+
+    if (!pixelUsesThisMaterial) {
+        return;
+    }
+
+    half row[K_OUT_MAX];
+    for (uint k = 0; k < K_OUT_MAX; k++) {
+        row[k] = pred[tid * K_OUT_MAX + k];
+    }
+    Material material = unpack_material(row, layout);
+
+    float  depth = gbufferDepth.read(pixel);
+    float2 uv    = (float2(pixel) + 0.5) / float2(screenSize);
+    float2 ndc   = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    float3 worldPos = world_position_from_depth(ndc, depth, invViewProj);
+
+    float4 normalSign = gbufferNormal.read(pixel);
+    float4 tangent    = gbufferTangent.read(pixel);
+
+    float3 color = shade_material(material, worldPos, normalSign.xyz,
+                                  tangent.xyz, normalSign.w, cameraPos,
+                                  irradianceMap, radianceMap, brdfLut);
+
+    sceneColor.write(float4(color, depth), pixel);
+}
+
+kernel void benchmark_decode(texture2d_array<float>          latents     [[texture(0)]],
+                         texture2d<float>                blueNoise   [[texture(4)]],
+                         texture2d<float, access::write> output      [[texture(9)]],
+                         device const half*              mlp         [[buffer(1)]],
+                         constant StepConstants&         consts      [[buffer(2)]],
+                         constant MaterialLayout&        layout      [[buffer(3)]],
+                         constant float2&                gridDequant [[buffer(4)]],
+                         constant uint&                  frameIndex  [[buffer(5)]],
+                         constant uint&                  renderFlags [[buffer(7)]],
+                         uint2 tgid [[threadgroup_position_in_grid]],
+                         uint  tid  [[thread_index_in_threadgroup]]) {
+    threadgroup half features[TILE_SIZE * F_IN];
+    threadgroup half hidden  [TILE_SIZE * K_HIDDEN];
+    threadgroup half pred    [TILE_SIZE * K_OUT_MAX];
+
+    uint2 screenSize = uint2(output.get_width(), output.get_height());
+    uint2 pixel = tgid * DECODE_TILE_SIDE + uint2(tid % DECODE_TILE_SIDE, tid / DECODE_TILE_SIDE);
+    bool  hasPixel = tid < TILE_SIZE && pixel.x < screenSize.x && pixel.y < screenSize.y;
+
+    // benchmark_fs gets this from dfdx/dfdy on a full-screen quad whose uv spans
+    // [0,1]; that reduces to a constant, so derive it directly
+    float lodf = clamp(log2(max(float(consts.srcW) / float(screenSize.x),
+                                float(consts.srcH) / float(screenSize.y))),
+                       0.0, float(consts.mipCount - 1));
+
+    float2 uv = (float2(pixel) + 0.5) / float2(screenSize);
+    if (tid < TILE_SIZE) {
+        uint lod = quantize_lod(lodf, float2(pixel), frameIndex,
+                                (renderFlags & RENDER_FLAG_STOCHASTIC_LOD) != 0u,
+                                blueNoise, consts);
+        half row[F_IN];
+        ntc_build_features(uv, lod, latents, latentSampler,
+                           gridDequant.x, gridDequant.y, consts, row);
+        for (uint i = 0; i < F_IN; i++) {
+            features[tid * F_IN + i] = row[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    mlp_forward_tensor_ops(mlp,
+                        consts.offsetW1, consts.offsetB1,
+                        consts.offsetW2, consts.offsetB2,
+                        consts.offsetW3, consts.offsetB3,
+                        features, hidden, pred);
+
+    if (!hasPixel) {
+        return;
+    }
+
+    half row[K_OUT_MAX];
+    for (uint k = 0; k < K_OUT_MAX; k++) {
+        row[k] = pred[tid * K_OUT_MAX + k];
+    }
+    Material material = unpack_material(row, layout);
+    float3 color = material.albedo + material.emissive;
+    output.write(float4(clamp(color, 0.0, 1.0), 1.0), pixel);
+}
+
+#endif  // NTC_TENSOR_OPS

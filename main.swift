@@ -3,9 +3,8 @@ import AppKit
 import Metal
 import MetalKit
 
-
-let benchmark = false
-
+let benchmark = true
+let benchmarkTensorOps = true
 
 let assetsDir    = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("assets")
 let gltfURL      = assetsDir.appendingPathComponent("models/flighthelmet/scene.gltf")
@@ -26,7 +25,7 @@ guard let device = MTLCreateSystemDefaultDevice() else {
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 
-let frame  = NSRect(x: 100, y: 100, width: 800, height: 800)
+let frame  = NSRect(x: 100, y: 100, width: 1920, height: 1080)
 let window = NSWindow(contentRect: frame,
                      styleMask: [.titled, .closable, .resizable, .miniaturizable],
                      backing: .buffered,
@@ -70,7 +69,8 @@ mtkView.preferredFramesPerSecond = 60
 
 let renderer = try Renderer(view: mtkView, device: device, gltfURL: gltfURL, hdrURL: hdrURL,
                             blueNoiseURL: blueNoiseURL,
-                            benchmark: benchmark, benchmarkNTC: benchmarkNTC)
+                            benchmark: benchmark, benchmarkTensorOps: benchmarkTensorOps,
+                            benchmarkNTC: benchmarkNTC)
 mtkView.delegate = renderer
 mtkView.renderer = renderer
 
