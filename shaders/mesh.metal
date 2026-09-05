@@ -140,7 +140,10 @@ static Material sample_material(float2                   uv,
                                 constant StepConstants&  consts,
                                 constant MaterialLayout& layout) {
     half pred[K_OUT_MAX];
-    ntc_decode_quant(uv, lod, latents, latentSampler,
+    // wrap here, not before select_lod: the lod needs the UNWRAPPED derivatives,
+    // but the latent sampler is clamp_to_edge, so a tiled uv would pin every
+    // pixel to the texture border
+    ntc_decode_quant(fract(uv), lod, latents, latentSampler,
                      gridDequant.x, gridDequant.y, mlp, consts, pred);
     return unpack_material(pred, layout);
 }
@@ -269,7 +272,9 @@ fragment GBufferOut gbuffer_fs(VertexOut               in            [[stage_in]
                           blueNoise, consts);
 
     GBufferOut out;
-    out.uvLodMaterial = float4(in.uv, float(lod), float(materialIndex));
+    // fract for the same reason as sample_material; lod above already used the
+    // unwrapped derivatives
+    out.uvLodMaterial = float4(fract(in.uv), float(lod), float(materialIndex));
     out.normalSign    = float4(in.worldNormal, in.tangentSign);
     out.tangent       = float4(in.worldTangent, 0.0);
     return out;
