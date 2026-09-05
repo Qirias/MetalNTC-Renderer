@@ -3,8 +3,8 @@ import AppKit
 import Metal
 import MetalKit
 
-let benchmark = true
-let benchmarkTensorOps = true
+let benchmark = false
+let benchmarkTensorOps = false
 
 let assetsDir    = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("assets")
 let gltfURL      = assetsDir.appendingPathComponent("models/flighthelmet/scene.gltf")

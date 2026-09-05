@@ -95,6 +95,16 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var resolvePSO: (any MTLComputePipelineState)? = nil
     private var prevSpin = matrix_identity_float4x4
 
+    /// One entry per material in the slot buffer the decode reads.
+    /// Mirrors  NTCMaterialSlot in mesh.metal
+    fileprivate struct NTCMaterialSlot {
+        var latents:     MTLResourceID
+        var mlp:         UInt64
+        var consts:      UInt64
+        var layout:      MaterialLayout
+        var gridDequant: SIMD2<Float>
+    }
+
     /// GPU resources decoded from one .ntc (one material). Shared by every
     /// submesh that references that material.
     fileprivate struct NTCResource {
@@ -116,7 +126,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         let ntcIndex:     Int
     }
 
-    private let ntcVariants: [(quality: Quality, resources: [NTCResource])]
+    private let ntcVariants: [(quality: Quality, resources: [NTCResource], slots: any MTLBuffer)]
     private var activeVariant: Int
 
     var availableQualities: [Quality] { ntcVariants.map(\.quality) }
@@ -209,7 +219,8 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         if benchmark {
             let resource = try Renderer.loadNTCResource(device: device, url: benchmarkNTC)
-            self.ntcVariants   = [(.high, [resource])]
+            self.ntcVariants   = [(.high, [resource],
+                                   Renderer.makeSlotBuffer(device: device, resources: [resource]))]
             self.activeVariant = 0
             self.submeshes     = []
             self.recenter      = matrix_identity_float4x4
@@ -242,13 +253,13 @@ final class Renderer: NSObject, MTKViewDelegate {
             materialNames.append(submesh.materialName)
         }
 
-        var variants: [(quality: Quality, resources: [NTCResource])] = []
+        var variants: [(quality: Quality, resources: [NTCResource], slots: any MTLBuffer)] = []
         for quality in Quality.allCases {
             let urls = materialNames.map { Renderer.ntcURL(dir: dir, material: $0, quality: quality) }
             guard urls.allSatisfy({ $0 != nil }) else { continue }
-            variants.append((quality, try urls.map {
-                try Renderer.loadNTCResource(device: device, url: $0!)
-            }))
+            let resources = try urls.map { try Renderer.loadNTCResource(device: device, url: $0!) }
+            variants.append((quality, resources,
+                             Renderer.makeSlotBuffer(device: device, resources: resources)))
         }
         guard !variants.isEmpty else {
             throw GLTF.Error.missing("no trained .ntc beside \(gltfURL.lastPathComponent)")
@@ -394,6 +405,27 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         self.historyIndex = 0
         self.historyValid = false
+    }
+
+    /// Packs every material into one buffer the decode can index, so a single
+    /// dispatch reaches all of them and each threadgroup loops over only the
+    /// materials in its own tile.
+    fileprivate static func makeSlotBuffer(device: any MTLDevice,
+                                           resources: [NTCResource]) -> any MTLBuffer {
+        // the shader static_asserts the same number
+        precondition(MemoryLayout<NTCMaterialSlot>.stride == 56, "NTCMaterialSlot must stay in step with mesh.metal")
+        var slots = resources.map { resource in
+            NTCMaterialSlot(latents: resource.latentTexture.gpuResourceID,
+                            mlp:     resource.mlpBuffer.gpuAddress,
+                            consts:  resource.constsBuffer.gpuAddress,
+                            layout:  resource.materialLayout,
+                            gridDequant: resource.gridDequant)
+        }
+        let buffer = device.makeBuffer(bytes: &slots,
+                                       length: MemoryLayout<NTCMaterialSlot>.stride * slots.count,
+                                       options: .storageModeShared)!
+        buffer.label = "NTC material slots"
+        return buffer
     }
 
     /// Where one material's latents live for a given quality, or nil if that
@@ -666,6 +698,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
             var invViewProj = simd_inverse(viewProj)
             var camPos = camEye
+            let variant = ntcVariants[activeVariant]
 
             if let gbufferUvLod = gbufferUvLod,
                let gbufferNormal = gbufferNormal,
@@ -743,10 +776,9 @@ final class Renderer: NSObject, MTKViewDelegate {
                 sky.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 sky.endEncoding()
 
-                // pass 3: tensor ops NTC decode + shading, one dispatch per material;
-                // a threadgroup covers one tile and shares one MLP, so the tile can
-                // only be decoded with one material's weights at a time; tiles with
-                // no pixel of the current material exit before the matmul
+                // pass 3: tensor ops NTC decode + shading, ONE dispatch. Each
+                // threadgroup loops over just the materials its own tile uses,
+                // so the cost follows screen coverage, not the material count.
                 let decode = commandBuffer.makeComputeCommandEncoder()!
                 decode.setComputePipelineState(decodePSO)
                 let tileSide = Renderer.decodeTileSide
@@ -763,22 +795,19 @@ final class Renderer: NSObject, MTKViewDelegate {
                 decode.setTexture(irradianceMap!, index: 1)
                 decode.setTexture(radianceMap!,   index: 2)
                 decode.setTexture(brdfLut!,       index: 3)
+                decode.setBuffer(variant.slots, offset: 0, index: 0)
                 decode.setBytes(&camPos,      length: MemoryLayout<SIMD3<Float>>.stride, index: 6)
                 decode.setBytes(&invViewProj, length: MemoryLayout<simd_float4x4>.stride, index: 9)
 
-                for (materialIndex, resource) in ntcVariants[activeVariant].resources.enumerated() {
-                    var resource = resource// setBytes needs inout
-                    var index = UInt32(materialIndex)
-                    decode.setTexture(resource.latentTexture, index: 0)
-                    decode.setBuffer(resource.mlpBuffer,    offset: 0, index: 1)
-                    decode.setBuffer(resource.constsBuffer, offset: 0, index: 2)
-                    decode.setBytes(&resource.materialLayout,
-                                    length: MemoryLayout<MaterialLayout>.stride, index: 3)
-                    decode.setBytes(&resource.gridDequant,
-                                    length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
-                    decode.setBytes(&index, length: MemoryLayout<UInt32>.stride, index: 8)
-                    decode.dispatchThreadgroups(tileCount, threadsPerThreadgroup: tileThreads)
+                // the slot buffer reaches these by address, so they need
+                // explicit residency
+                for resource in variant.resources {
+                    decode.useResource(resource.latentTexture, usage: .read)
+                    decode.useResource(resource.mlpBuffer,     usage: .read)
+                    decode.useResource(resource.constsBuffer,  usage: .read)
                 }
+
+                decode.dispatchThreadgroups(tileCount, threadsPerThreadgroup: tileThreads)
                 decode.endEncoding()
             } else {
                 // no tensor ops: one MLP per fragment

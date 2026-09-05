@@ -118,7 +118,7 @@ static inline uint select_lod(float2 uv, float2 pixelCoord, uint frameIndex,
     return quantize_lod(lodf, pixelCoord, frameIndex, stochastic, blueNoise, consts);
 }
 
-static Material unpack_material(thread const half* pred, constant MaterialLayout& layout) {
+static Material unpack_material(thread const half* pred, MaterialLayout layout) {
     Material m;
     m.albedo    = read3(pred, layout.albedo,    float3(0.5));
     m.roughness = read1(pred, layout.roughness, 1.0);
@@ -237,6 +237,19 @@ fragment float4 benchmark_fs(BenchmarkOut                   in          [[stage_
 
 #ifdef NTC_TENSOR_OPS
 
+// ne neural material, reachable without rebinding, so a single dispatch can
+// decode any of them and each threadgroup loops over just the ones its own tile uses
+struct NTCMaterialSlot {
+    texture2d_array<float>      latents;
+    device const half*          mlp;
+    device const StepConstants* consts;
+    MaterialLayout              layout;
+    float2                      gridDequant;
+};
+
+// no neural material at this pixel
+#define NTC_NO_MATERIAL 0x7FFFFFFFu
+
 struct GBufferOut {
     float4 uvLodMaterial [[color(0)]];  // uv.xy, lod, material index (-1 = no geometry)
     float4 normalSign    [[color(1)]];  // world normal.xyz, tangent sign
@@ -278,96 +291,91 @@ kernel void ntc_decode_shade(texture2d<float>                gbufferUvLod   [[te
                              texture2d<float>                gbufferTangent [[texture(7)]],
                              depth2d<float>                  gbufferDepth   [[texture(8)]],
                              texture2d<float, access::write> sceneColor     [[texture(9)]],
-                             texture2d_array<float>          latents        [[texture(0)]],
                              texturecube<float>              irradianceMap  [[texture(1)]],
                              texturecube<float>              radianceMap    [[texture(2)]],
                              texture2d<float>                brdfLut        [[texture(3)]],
-                             device const half*              mlp            [[buffer(1)]],
-                             constant StepConstants&         consts         [[buffer(2)]],
-                             constant MaterialLayout&        layout         [[buffer(3)]],
-                             constant float2&                gridDequant    [[buffer(4)]],
+                             device const NTCMaterialSlot*   slots          [[buffer(0)]],
                              constant float3&                cameraPos      [[buffer(6)]],
-                             constant uint&                  materialIndex  [[buffer(8)]],
                              constant float4x4&              invViewProj    [[buffer(9)]],
                              uint2 tgid [[threadgroup_position_in_grid]],
                              uint  tid  [[thread_index_in_threadgroup]]) {
     threadgroup half features[TILE_SIZE * F_IN];
     threadgroup half hidden  [TILE_SIZE * K_HIDDEN];
     threadgroup half pred    [TILE_SIZE * K_OUT_MAX];
-    threadgroup atomic_uint tileUsesThisMaterial;
+    threadgroup atomic_uint nextMaterial;
 
-    uint2 tileOrigin = tgid * DECODE_TILE_SIDE;
-    uint2 screenSize = uint2(gbufferUvLod.get_width(), gbufferUvLod.get_height());
-
-    if (tid == 0) {
-        atomic_store_explicit(&tileUsesThisMaterial, 0u, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    uint2 screenSize = uint2(gbufferNormal.get_width(), gbufferNormal.get_height());
+    uint2 pixel = tgid * DECODE_TILE_SIDE + uint2(tid % DECODE_TILE_SIDE, tid / DECODE_TILE_SIDE);
     // tid < TILE_SIZE has no pixel but will still be used by the cooperative tensor
-    uint2  pixel    = tileOrigin + uint2(tid % DECODE_TILE_SIDE, tid / DECODE_TILE_SIDE);
-    bool   hasPixel = tid < TILE_SIZE && pixel.x < screenSize.x && pixel.y < screenSize.y;
+    bool hasPixel = tid < TILE_SIZE && pixel.x < screenSize.x && pixel.y < screenSize.y;
+
     float4 uvLodMaterial = hasPixel ? gbufferUvLod.read(pixel) : float4(0, 0, 0, -1);
+    bool pending    = uvLodMaterial.w >= 0.0;
+    uint myMaterial = pending ? uint(uvLodMaterial.w) : NTC_NO_MATERIAL;
 
-    bool pixelUsesThisMaterial = uvLodMaterial.w == float(materialIndex);
-    if (pixelUsesThisMaterial) {
-        atomic_store_explicit(&tileUsesThisMaterial, 1u, memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // one pass per distinct material in this tile; each retires at least one of
+    // them, so this terminates
+    while (true) {
+        if (tid == 0) {
+            atomic_store_explicit(&nextMaterial, NTC_NO_MATERIAL, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // mlp_forward_tensor_ops is cooperative and all TILE_THREADS
-    // lanes have to reach it, so a per-thread "if (!pixelUsesThisMaterial) return;"
-    // would be wrong
-    if (atomic_load_explicit(&tileUsesThisMaterial, memory_order_relaxed) == 0u) {
-        return;
-    }
+        if (pending) {
+            atomic_fetch_min_explicit(&nextMaterial, myMaterial, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Every row is filled, including pixels belonging to other materials;
-    // their results are simply not written out because it gets caught
-    // by "if (!pixelUsesThisMaterial)"
-    if (tid < TILE_SIZE) {
-        half row[F_IN];
-        ntc_build_features(uvLodMaterial.xy,
-                           uint(max(uvLodMaterial.z, 0.0)),
-                           latents,
-                           latentSampler,
-                           gridDequant.x, gridDequant.y,
-                           consts, row);
-        for (uint i = 0; i < F_IN; i++) {
-            features[tid * F_IN + i] = row[i];
+        // uniform across the threadgroup, which it must be: every lane has to
+        // reach mlp_forward_tensor_ops
+        uint materialIndex = atomic_load_explicit(&nextMaterial, memory_order_relaxed);
+        if (materialIndex == NTC_NO_MATERIAL) break;
+
+        device const NTCMaterialSlot& slot = slots[materialIndex];
+
+        // every row is filled, even ones belonging to another material; their
+        // results are simply not written out
+        if (tid < TILE_SIZE) {
+            half row[F_IN];
+            ntc_build_features(uvLodMaterial.xy, uint(max(uvLodMaterial.z, 0.0)),
+                               slot.latents, latentSampler,
+                               slot.gridDequant.x, slot.gridDequant.y, *slot.consts, row);
+            for (uint i = 0; i < F_IN; i++) {
+                features[tid * F_IN + i] = row[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        mlp_forward_tensor_ops(slot.mlp,
+                               slot.consts->offsetW1, slot.consts->offsetB1,
+                               slot.consts->offsetW2, slot.consts->offsetB2,
+                               slot.consts->offsetW3, slot.consts->offsetB3,
+                               features, hidden, pred);
+
+        if (pending && myMaterial == materialIndex) {
+            half row[K_OUT_MAX];
+            for (uint k = 0; k < K_OUT_MAX; k++) {
+                row[k] = pred[tid * K_OUT_MAX + k];
+            }
+            Material material = unpack_material(row, slot.layout);
+
+            float  depth = gbufferDepth.read(pixel);
+            float2 uv    = (float2(pixel) + 0.5) / float2(screenSize);
+            float2 ndc   = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+            float3 worldPos = world_position_from_depth(ndc, depth, invViewProj);
+
+            float4 normalSign = gbufferNormal.read(pixel);
+            float4 tangent    = gbufferTangent.read(pixel);
+
+            float3 color = shade_material(material, worldPos, normalSign.xyz,
+                                          tangent.xyz, normalSign.w, cameraPos,
+                                          irradianceMap, radianceMap, brdfLut);
+
+            // same convention as mesh_fs: linear HDR, depth in alpha
+            sceneColor.write(float4(color, depth), pixel);
+            pending = false;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    mlp_forward_tensor_ops(mlp,
-                           consts.offsetW1, consts.offsetB1,
-                           consts.offsetW2, consts.offsetB2,
-                           consts.offsetW3, consts.offsetB3,
-                           features, hidden, pred);
-
-    if (!pixelUsesThisMaterial) {
-        return;
-    }
-
-    half row[K_OUT_MAX];
-    for (uint k = 0; k < K_OUT_MAX; k++) {
-        row[k] = pred[tid * K_OUT_MAX + k];
-    }
-    Material material = unpack_material(row, layout);
-
-    float  depth = gbufferDepth.read(pixel);
-    float2 uv    = (float2(pixel) + 0.5) / float2(screenSize);
-    float2 ndc   = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    float3 worldPos = world_position_from_depth(ndc, depth, invViewProj);
-
-    float4 normalSign = gbufferNormal.read(pixel);
-    float4 tangent    = gbufferTangent.read(pixel);
-
-    float3 color = shade_material(material, worldPos, normalSign.xyz,
-                                  tangent.xyz, normalSign.w, cameraPos,
-                                  irradianceMap, radianceMap, brdfLut);
-
-    sceneColor.write(float4(color, depth), pixel);
 }
 
 kernel void benchmark_decode(texture2d_array<float>          latents     [[texture(0)]],
