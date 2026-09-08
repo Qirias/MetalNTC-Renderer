@@ -2,17 +2,15 @@
 
 The optional real-time viewer + demo assets for [MetalNTC](https://github.com/Qirias/MetalNTC).
 
+![thumbnail](assets/title_image.png)
+
 This repository is consumed as a git submodule at `sources/NTCRenderer` of the
-main MetalNTC package. On its own it does not build — it depends on the
+main MetalNTC package. On its own it does not build, it depends on the
 `NTCCore`, `NTCShared`, and `AAPLMath` targets from the parent package.
 
 Contents:
-- `*.swift`, `shaders/` — the `NTCRenderer` executable target (draws a glTF mesh
-  whose fragment shader runs the NTC decoder per pixel; PBR/IBL + temporal STF
-  resolve).
-- `assets/models/` — demo meshes (FlightHelmet, SciFiHelmet) with their trained
-  `.ntc` files beside each glTF.
-- `assets/hdr/` — the environment map used for image-based lighting.
+
+`*.swift` and `shaders/` contain the `NTCRenderer` app. It renders a glTF mesh and decodes NTC data in the fragment shader for each pixel, with PBR/IBL lighting and temporal STF resolve. The app also includes a benchmark mode that renders a full-screen texture where each pixel runs the forward pass, or inference. There are two benchmark variants: one using regular ALUs for devices that do not support tensor cores, and a `benchmarkTensorOps` variant for M5 and newer devices.
 
 ## Use
 
